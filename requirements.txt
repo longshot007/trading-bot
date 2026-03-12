@@ -1,1 +1,5 @@
-
+alpaca-trade-api
+pandas
+yfinance
+numpy
+schedule
