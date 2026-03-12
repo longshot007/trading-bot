@@ -2,8 +2,8 @@ import yfinance as yf
 import alpaca_trade_api as tradeapi
 import pandas as pd
 
-API_KEY = "YOUR_KEY"
-SECRET_KEY = "YOUR_SECRET"
+API_KEY = os.environ.get("ALPACA_API_KEY")
+SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 
 BASE_URL = "https://paper-api.alpaca.markets"
 
