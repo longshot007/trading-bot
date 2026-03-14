@@ -1,11 +1,11 @@
 name: trading-bot
 
 on:
-  workflow_dispatch:   # manual run
+  workflow_dispatch:
   schedule:
-    - cron: "30 14 * * 1-5"  # 14:30 UTC → 9:30 ET
-    - cron: "45 14 * * 1-5"  # 14:45 UTC → 9:45 ET
-    - cron: "0 15 * * 1-5"   # 15:00 UTC → 10:00 ET
+    - cron: "30 14 * * 1-5"
+    - cron: "45 14 * * 1-5"
+    - cron: "0 15 * * 1-5"
     - cron: "15 15 * * 1-5"
     - cron: "30 15 * * 1-5"
     - cron: "45 15 * * 1-5"
@@ -32,15 +32,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: pip install -r requirements.txt
+
+      - name: Run Trading Bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python bot.py
 
       - name: Run bot
         run: python bot.py
