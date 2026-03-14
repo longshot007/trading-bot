@@ -1,50 +1,139 @@
-import yfinance as yf
+import os
 import alpaca_trade_api as tradeapi
 import pandas as pd
+import yfinance as yf
+from datetime import datetime
 
-import os
-
-env:
-  APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
-  APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
-  APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
-
+API_KEY = os.environ.get("ALPACA_API_KEY")
+SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
 
-stocks = [
-"AAPL","MSFT","NVDA","AMZN","GOOGL",
-"META","TSLA","AMD","AVGO","NFLX"
+# ----- SETTINGS -----
+
+WATCHLIST = [
+    "AAPL","NVDA","TSLA","AMD","META",
+    "MSFT","AMZN","GOOGL","SPY","QQQ"
 ]
 
-def momentum(stock):
+MOMENTUM_LOOKBACK = 5
+STOP_LOSS = 0.03
+TAKE_PROFIT = 0.06
+RISK_PER_TRADE = 0.05
 
-    data = yf.download(stock, period="30d", interval="1d")
+# --------------------
 
-    start = data["Close"].iloc[0]
-    end = data["Close"].iloc[-1]
+def market_is_open():
+    clock = api.get_clock()
+    return clock.is_open
 
-    return (end/start)-1
+def get_account_balance():
+    account = api.get_account()
+    return float(account.cash)
 
-scores = {}
-
-for s in stocks:
-
+def get_positions():
     try:
-        scores[s] = momentum(s)
+        return api.list_positions()
     except:
-        pass
+        return []
 
-top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+def get_momentum_score(ticker):
+    data = yf.download(ticker, period="10d", interval="1d", progress=False)
 
-for stock in top:
+    if len(data) < MOMENTUM_LOOKBACK:
+        return 0
+
+    recent = data["Close"].iloc[-MOMENTUM_LOOKBACK:]
+    momentum = (recent[-1] - recent[0]) / recent[0]
+
+    return momentum
+
+def find_best_stock():
+
+    scores = {}
+
+    for ticker in WATCHLIST:
+        try:
+            score = get_momentum_score(ticker)
+            scores[ticker] = score
+        except:
+            continue
+
+    if not scores:
+        return None
+
+    best = max(scores, key=scores.get)
+
+    if scores[best] > 0:
+        return best
+
+    return None
+
+def calculate_position_size(price):
+
+    cash = get_account_balance()
+
+    risk_amount = cash * RISK_PER_TRADE
+
+    shares = int(risk_amount / price)
+
+    return max(shares, 1)
+
+def place_trade(ticker):
+
+    price = yf.download(ticker, period="1d", interval="1m", progress=False)["Close"].iloc[-1]
+
+    shares = calculate_position_size(price)
+
+    stop_price = round(price * (1 - STOP_LOSS), 2)
+    take_price = round(price * (1 + TAKE_PROFIT), 2)
 
     api.submit_order(
-        symbol=stock[0],
-        qty=1,
+        symbol=ticker,
+        qty=shares,
         side="buy",
         type="market",
-        time_in_force="gtc"
+        time_in_force="gtc",
+        order_class="bracket",
+        stop_loss={"stop_price": stop_price},
+        take_profit={"limit_price": take_price}
     )
 
-    print("BUY", stock[0])
+    print(f"BUY {shares} {ticker}")
+    print(f"Entry: {price}")
+    print(f"Stop Loss: {stop_price}")
+    print(f"Take Profit: {take_price}")
+
+def already_holding(ticker):
+
+    positions = get_positions()
+
+    for p in positions:
+        if p.symbol == ticker:
+            return True
+
+    return False
+
+def run_bot():
+
+    print("Bot started:", datetime.now())
+
+    if not market_is_open():
+        print("Market closed")
+        return
+
+    best_stock = find_best_stock()
+
+    if best_stock is None:
+        print("No momentum trade found")
+        return
+
+    if already_holding(best_stock):
+        print("Already holding", best_stock)
+        return
+
+    place_trade(best_stock)
+
+if __name__ == "__main__":
+    run_bot()
