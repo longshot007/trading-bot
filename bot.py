@@ -4,10 +4,10 @@ import pandas as pd
 
 import os
 
-API_KEY = os.environ.get("ALPACA_API_KEY_ID")
-SECRET_KEY = os.environ.get("ALPACA_API_SECRET_KEY")
-
-BASE_URL = "https://paper-api.alpaca.markets"
+env:
+  APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+  APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+  APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
 
