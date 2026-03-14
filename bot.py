@@ -9,6 +9,7 @@ env:
   APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
   APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
 
+
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
 
 stocks = [
