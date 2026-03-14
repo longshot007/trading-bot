@@ -5,8 +5,8 @@ import pandas as pd
 import os
 
 env:
-  ALPACA_API_KEY_ID: ${{ secrets.ALAPCA_API_KEY_ID }}
-  ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+  APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+  APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
   APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
