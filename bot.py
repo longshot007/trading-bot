@@ -4,7 +4,7 @@ import pandas as pd
 
 import os
 
-API_KEY = os.environ.get("ALPACA_API_KEY")
+API_KEY = os.environ.get("ALPACA_API_KEY_ID")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 
 BASE_URL = "https://paper-api.alpaca.markets"
