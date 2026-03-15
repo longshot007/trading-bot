@@ -5,7 +5,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # --- Alpaca setup ---
-FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 API_KEY = os.environ["APCA_API_KEY_ID"]
 SECRET_KEY = os.environ["APCA_API_SECRET_KEY"]
 BASE_URL = os.environ["APCA_API_BASE_URL"]
