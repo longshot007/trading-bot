@@ -42,7 +42,7 @@ print(f"Best momentum: {best_symbol} ({momentum_scores[best_symbol]:.2%})")
 # --- Determine position size ---
 cash = get_cash()
 price = api.get_last_trade(best_symbol).price
-qty = int((cash * 0.95) / price)  # use 95% of cash
+qty = int((cash * 0.55) / price)  # use 55% of cash
 if qty <= 0:
     print("Insufficient funds to buy.")
     exit()
