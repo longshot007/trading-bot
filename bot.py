@@ -1,139 +1,79 @@
 import os
 import alpaca_trade_api as tradeapi
-import pandas as pd
 import yfinance as yf
-from datetime import datetime
+import pandas as pd
+from datetime import datetime, timedelta
 
-API_KEY = os.environ.get("ALPACA_API_KEY")
-SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
+# --- Alpaca setup ---
+API_KEY = os.environ["APCA_API_KEY_ID"]
+SECRET_KEY = os.environ["APCA_API_SECRET_KEY"]
+BASE_URL = os.environ["APCA_API_BASE_URL"]
 
-api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
+api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
 
-# ----- SETTINGS -----
+# --- Parameters ---
+SYMBOLS = ["AAPL", "TSLA", "MSFT", "AMZN"]  # example watchlist
+LOOKBACK = 5  # days for momentum calculation
+STOP_LOSS_PCT = 0.02  # 2% stop loss
 
-WATCHLIST = [
-    "AAPL","NVDA","TSLA","AMD","META",
-    "MSFT","AMZN","GOOGL","SPY","QQQ"
-]
+# --- Helper functions ---
+def get_momentum(symbol, days=LOOKBACK):
+    df = yf.download(symbol, period=f"{days+1}d", interval="1d")
+    if df.empty or len(df) < 2:
+        return 0
+    momentum = df['Close'][-1] / df['Close'][0] - 1
+    return momentum
 
-MOMENTUM_LOOKBACK = 5
-STOP_LOSS = 0.03
-TAKE_PROFIT = 0.06
-RISK_PER_TRADE = 0.05
-
-# --------------------
-
-def market_is_open():
-    clock = api.get_clock()
-    return clock.is_open
-
-def get_account_balance():
+def get_cash():
     account = api.get_account()
     return float(account.cash)
 
-def get_positions():
-    try:
-        return api.list_positions()
-    except:
-        return []
+# --- Check market status ---
+clock = api.get_clock()
+if not clock.is_open:
+    print("Market is closed.")
+    exit()
 
-def get_momentum_score(ticker):
-    data = yf.download(ticker, period="10d", interval="1d", progress=False)
+# --- Calculate momentum ---
+momentum_scores = {s: get_momentum(s) for s in SYMBOLS}
+best_symbol = max(momentum_scores, key=momentum_scores.get)
+print(f"Best momentum: {best_symbol} ({momentum_scores[best_symbol]:.2%})")
 
-    if len(data) < MOMENTUM_LOOKBACK:
-        return 0
+# --- Determine position size ---
+cash = get_cash()
+price = api.get_last_trade(best_symbol).price
+qty = int((cash * 0.95) / price)  # use 95% of cash
+if qty <= 0:
+    print("Insufficient funds to buy.")
+    exit()
 
-    recent = data["Close"].iloc[-MOMENTUM_LOOKBACK:]
-    momentum = (recent[-1] - recent[0]) / recent[0]
-
-    return momentum
-
-def find_best_stock():
-
-    scores = {}
-
-    for ticker in WATCHLIST:
-        try:
-            score = get_momentum_score(ticker)
-            scores[ticker] = score
-        except:
-            continue
-
-    if not scores:
-        return None
-
-    best = max(scores, key=scores.get)
-
-    if scores[best] > 0:
-        return best
-
-    return None
-
-def calculate_position_size(price):
-
-    cash = get_account_balance()
-
-    risk_amount = cash * RISK_PER_TRADE
-
-    shares = int(risk_amount / price)
-
-    return max(shares, 1)
-
-def place_trade(ticker):
-
-    price = yf.download(ticker, period="1d", interval="1m", progress=False)["Close"].iloc[-1]
-
-    shares = calculate_position_size(price)
-
-    stop_price = round(price * (1 - STOP_LOSS), 2)
-    take_price = round(price * (1 + TAKE_PROFIT), 2)
-
+# --- Submit order ---
+try:
     api.submit_order(
-        symbol=ticker,
-        qty=shares,
-        side="buy",
-        type="market",
-        time_in_force="gtc",
-        order_class="bracket",
-        stop_loss={"stop_price": stop_price},
-        take_profit={"limit_price": take_price}
+        symbol=best_symbol,
+        qty=qty,
+        side='buy',
+        type='market',
+        time_in_force='day'
     )
+    print(f"Market buy submitted for {qty} shares of {best_symbol}")
+except Exception as e:
+    print(f"Order failed: {e}")
 
-    print(f"BUY {shares} {ticker}")
-    print(f"Entry: {price}")
-    print(f"Stop Loss: {stop_price}")
-    print(f"Take Profit: {take_price}")
-
-def already_holding(ticker):
-
-    positions = get_positions()
-
-    for p in positions:
-        if p.symbol == ticker:
-            return True
-
-    return False
-
-def run_bot():
-
-    print("Bot started:", datetime.now())
-
-    if not market_is_open():
-        print("Market closed")
-        return
-
-    best_stock = find_best_stock()
-
-    if best_stock is None:
-        print("No momentum trade found")
-        return
-
-    if already_holding(best_stock):
-        print("Already holding", best_stock)
-        return
-
-    place_trade(best_stock)
+# --- Apply stop-loss (bracket order) ---
+try:
+    stop_price = price * (1 - STOP_LOSS_PCT)
+    api.submit_order(
+        symbol=best_symbol,
+        qty=qty,
+        side='sell',
+        type='stop',
+        stop_price=round(stop_price, 2),
+        time_in_force='day'
+    )
+    print(f"Stop-loss set at ${stop_price:.2f}")
+except Exception as e:
+    print(f"Stop-loss setup failed: {e}")
 
 if __name__ == "__main__":
     run_bot()
