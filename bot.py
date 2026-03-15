@@ -1,79 +1,70 @@
+# =========================
+# Alpaca Paper Trading Bot - Full Turnkey Version
+# =========================
+
 import os
 import alpaca_trade_api as tradeapi
-import yfinance as yf
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- Alpaca setup ---
+# --- API setup ---
 API_KEY = os.environ["APCA_API_KEY_ID"]
 SECRET_KEY = os.environ["APCA_API_SECRET_KEY"]
-BASE_URL = os.environ["APCA_API_BASE_URL"]
+BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
 
-# --- Parameters ---
-SYMBOLS = ["AAPL", "TSLA", "MSFT", "AMZN"]  # example watchlist
-LOOKBACK = 5  # days for momentum calculation
-STOP_LOSS_PCT = 0.02  # 2% stop loss
+# --- Bot settings ---
+SYMBOLS = ["AAPL", "MSFT", "GOOG"]   # Symbols to trade
+INVESTMENT_PERCENTAGE = 0.25         # Max 25% of total cash for this bot run
+RISK_PER_TRADE = 0.1                 # Fraction of cash to risk per trade (10%)
 
-# --- Helper functions ---
-def get_momentum(symbol, days=LOOKBACK):
-    df = yf.download(symbol, period=f"{days+1}d", interval="1d")
-    if df.empty or len(df) < 2:
-        return 0
-    momentum = df['Close'][-1] / df['Close'][0] - 1
-    return momentum
-
-def get_cash():
-    account = api.get_account()
-    return float(account.cash)
-
-# --- Check market status ---
+# --- Check if market is open ---
 clock = api.get_clock()
 if not clock.is_open:
-    print("Market is closed.")
+    print(f"{datetime.now()} - Market is closed. Exiting bot.")
     exit()
 
-# --- Calculate momentum ---
-momentum_scores = {s: get_momentum(s) for s in SYMBOLS}
+# --- Fetch account cash ---
+account = api.get_account()
+cash = float(account.cash)
+cash_for_trades = cash * INVESTMENT_PERCENTAGE
+
+# --- Placeholder for momentum logic ---
+# Replace this with your real calculation for momentum
+momentum_scores = {s: 0 for s in SYMBOLS}   # Example: all zeros
 best_symbol = max(momentum_scores, key=momentum_scores.get)
-print(f"Best momentum: {best_symbol} ({momentum_scores[best_symbol]:.2%})")
 
-# --- Determine position size ---
-cash = get_cash()
-price = api.get_last_trade(best_symbol).price
-qty = int((cash * 0.25) / price)  # use 25% of cash
-if qty <= 0:
-    print("Insufficient funds to buy.")
-    exit()
+# --- Get latest price for selected symbol ---
+trade_info = api.get_last_trade(best_symbol)
+price = float(trade_info.price)
 
-# --- Submit order ---
-try:
-    api.submit_order(
+# --- Calculate quantity based on fractional risk ---
+qty = int((cash_for_trades * RISK_PER_TRADE) / price)
+
+# --- Debug prints ---
+print(f"{datetime.now()} - Cash available: ${cash:,.2f}")
+print(f"{datetime.now()} - Max cash for this bot run (25%): ${cash_for_trades:,.2f}")
+print(f"{datetime.now()} - Best symbol: {best_symbol}, Price: ${price:.2f}")
+print(f"{datetime.now()} - Fractional risk per trade: {RISK_PER_TRADE*100:.1f}%")
+print(f"{datetime.now()} - Quantity to buy: {qty}")
+
+# --- Submit order (paper only) ---
+if qty > 0:
+    order = api.submit_order(
         symbol=best_symbol,
         qty=qty,
         side='buy',
         type='market',
         time_in_force='day'
     )
-    print(f"Market buy submitted for {qty} shares of {best_symbol}")
-except Exception as e:
-    print(f"Order failed: {e}")
+    print(f"{datetime.now()} - Order submitted for {qty} shares of {best_symbol}")
+else:
+    print(f"{datetime.now()} - Qty calculated as 0, skipping order.")
 
-# --- Apply stop-loss (bracket order) ---
-try:
-    stop_price = price * (1 - STOP_LOSS_PCT)
-    api.submit_order(
-        symbol=best_symbol,
-        qty=qty,
-        side='sell',
-        type='stop',
-        stop_price=round(stop_price, 2),
-        time_in_force='day'
-    )
-    print(f"Stop-loss set at ${stop_price:.2f}")
-except Exception as e:
-    print(f"Stop-loss setup failed: {e}")
+# --- List recent orders for verification ---
+orders = api.list_orders(status='all', limit=5)
+for o in orders:
+    print(f"Order: {o.symbol}, Side: {o.side}, Filled: {o.filled_qty}, Status: {o.status}")
 
 if __name__ == "__main__":
     run_bot()
