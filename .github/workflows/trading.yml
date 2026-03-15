@@ -1,52 +1,32 @@
-name: trading-bot
+name: Alpaca Momentum Trading Bot
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 14 * * 1-5"
-    - cron: "45 14 * * 1-5"
-    - cron: "0 15 * * 1-5"
-    - cron: "15 15 * * 1-5"
-    - cron: "30 15 * * 1-5"
-    - cron: "45 15 * * 1-5"
-    - cron: "0 16 * * 1-5"
-    - cron: "15 16 * * 1-5"
-    - cron: "30 16 * * 1-5"
-    - cron: "45 16 * * 1-5"
-    - cron: "0 17 * * 1-5"
-    - cron: "15 17 * * 1-5"
-    - cron: "30 17 * * 1-5"
-    - cron: "45 17 * * 1-5"
-    - cron: "0 18 * * 1-5"
-    - cron: "15 18 * * 1-5"
-    - cron: "30 18 * * 1-5"
-    - cron: "45 18 * * 1-5"
-    - cron: "0 19 * * 1-5"
-    - cron: "15 19 * * 1-5"
-    - cron: "30 19 * * 1-5"
-    - cron: "45 19 * * 1-5"
-    - cron: "0 20 * * 1-5"
+    - cron: "*/15 * * * 1-5"
 
 jobs:
-  run-bot:
+  trade:
     runs-on: ubuntu-latest
 
+    env:
+      APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+      APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      APCA_API_BASE_URL: https://paper-api.alpaca.markets
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Trading Bot
-        env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      - name: Run trading bot
         run: python bot.py
 
       - name: Run bot
