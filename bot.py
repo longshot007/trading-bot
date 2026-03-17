@@ -10,7 +10,6 @@ BASE_URL = "https://paper-api.alpaca.markets"
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
 SYMBOLS = ["AAPL", "TSLA", "NVDA"]
-
 TRADE_QTY = 1
 
 
@@ -56,7 +55,7 @@ def place_trade(symbol):
         print("Trade failed:", e)
 
 
-def run():
+def run_bot():
 
     if not market_open():
         print("Market closed")
@@ -77,7 +76,7 @@ def run():
     print("Run complete")
 
 
-run()
+run_bot()
 
 print("=== BOT END ===")
 
