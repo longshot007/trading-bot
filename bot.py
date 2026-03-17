@@ -56,71 +56,108 @@ print("Backtest results (% profit over last {} days):".format(BACKTEST_DAYS))
 for symbol, pct in backtest_results:
     print(f"{symbol}: {pct}%")
 
-# =========================
-# 2️⃣ Market hours check
-# =========================
-clock = api.get_clock()
-if not clock.is_open:
-    print(f"{datetime.now()} - Market closed. Exiting bot.")
-    exit()
+import os
+from datetime import datetime, timedelta
+import alpaca_trade_api as tradeapi
+import pandas as pd
 
-# =========================
-# 3️⃣ Fetch account cash and positions
-# =========================
-account = api.get_account()
-cash = float(account.cash)
-cash_for_trades = cash * INVESTMENT_PERCENTAGE
+# API credentials from GitHub Secrets
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"
 
-open_positions = api.list_positions()
-open_symbols = [p.symbol for p in open_positions]
+# Connect to Alpaca
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
-# =========================
-# 4️⃣ Select best momentum stocks
-# =========================
-momentum_scores = {}
-for sym in SYMBOLS:
-    # Fetch last 5-min bars for momentum
-    bars = api.get_bars(sym, tradeapi.TimeFrame.Minute, limit=5).df
-    momentum = (bars['close'][-1] - bars['close'][0]) / bars['close'][0]
-    momentum_scores[sym] = momentum
+# Trading settings
+SYMBOLS = [
+    "AAPL","TSLA","NVDA","AMD","META",
+    "AMZN","MSFT","GOOGL","SPY","QQQ"
+]
 
-sorted_symbols = sorted(momentum_scores.items(), key=lambda x: x[1], reverse=True)
+TIMEFRAME = "5Min"
+LOOKBACK_DAYS = 1
+TRADE_QTY = 1
+MOMENTUM_THRESHOLD = 0.002  # 0.2%
 
-# =========================
-# 5️⃣ Place trades respecting diversification & risk
-# =========================
-positions_added = 0
-for symbol, score in sorted_symbols:
-    if positions_added >= MAX_POSITIONS:
-        break
-    if symbol in open_symbols:
-        continue  # already have position
-    if score <= 0:
-        continue  # skip negative momentum
+def get_rfc3339_time(days_back=1):
+    """Return properly formatted RFC3339 timestamp"""
+    return (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    price = float(api.get_last_trade(symbol).price)
-    qty = int((cash_for_trades * RISK_PER_TRADE) / price)
-    if qty <= 0:
-        continue
+def market_is_open():
+    clock = api.get_clock()
+    return clock.is_open
 
-    order = api.submit_order(
-        symbol=symbol,
-        qty=qty,
-        side='buy',
-        type='market',
-        time_in_force='day'
-    )
-    positions_added += 1
+def get_momentum(symbol):
+    try:
+        start = get_rfc3339_time(LOOKBACK_DAYS)
 
-    stop_price = round(price * (1 - STOP_LOSS_PERCENT), 2)
-    take_profit_price = round(price * (1 + TAKE_PROFIT_PERCENT), 2)
+        bars = api.get_bars(
+            symbol,
+            TIMEFRAME,
+            start=start,
+            limit=50
+        ).df
 
-    print(f"{datetime.now()} - Bought {qty} shares of {symbol} at ${price:.2f}")
-    print(f"  Stop-loss at ${stop_price}, Take-profit at ${take_profit_price}")
+        if len(bars) < 2:
+            return None
 
-# =========================
-# 6️⃣ Debug recent orders
-# =========================
-orders = api.list_orders(status='all', limit=10)
-for o in orders:
-    print(f"Order: {o.symbol}, Side: {o.side}, Filled: {o.filled_qty}, Status: {o.status}")
+        last_price = bars.close.iloc[-1]
+        prev_price = bars.close.iloc[-2]
+
+        momentum = (last_price - prev_price) / prev_price
+
+        return momentum
+
+    except Exception as e:
+        print(f"Momentum error for {symbol}: {e}")
+        return None
+
+def position_exists(symbol):
+    try:
+        api.get_position(symbol)
+        return True
+    except:
+        return False
+
+def place_trade(symbol):
+    try:
+        print(f"Placing trade for {symbol}")
+
+        api.submit_order(
+            symbol=symbol,
+            qty=TRADE_QTY,
+            side="buy",
+            type="market",
+            time_in_force="day"
+        )
+
+    except Exception as e:
+        print(f"Trade failed for {symbol}: {e}")
+
+def run_bot():
+
+    print("Bot started")
+
+    if not market_is_open():
+        print("Market closed")
+        return
+
+    for symbol in SYMBOLS:
+
+        momentum = get_momentum(symbol)
+
+        if momentum is None:
+            continue
+
+        print(f"{symbol} momentum: {momentum}")
+
+        if momentum > MOMENTUM_THRESHOLD:
+
+            if not position_exists(symbol):
+                place_trade(symbol)
+
+    print("Bot finished run")
+
+if __name__ == "__main__":
+    run_bot()
