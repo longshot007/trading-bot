@@ -1,10 +1,10 @@
 name: Phase-4 Trading Bot
 
-# Run every 5 minutes (cron)
+# Run every 5 minutes
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch: # manual trigger
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -31,6 +31,12 @@ jobs:
         run: |
           python bot.py
 
+      - name: Archive trades log
+        if: always()
+        uses: actions/upload-artifact@v4   # <- Updated to v4
+        with:
+          name: trades-log
+          path: phase4_trades_log.csv
       - name: Archive trades log
         if: always()
         uses: actions/upload-artifact@v3
