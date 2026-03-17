@@ -37,9 +37,3 @@ jobs:
         with:
           name: trades-log
           path: phase4_trades_log.csv
-      - name: Archive trades log
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: trades-log
-          path: phase4_trades_log.csv
