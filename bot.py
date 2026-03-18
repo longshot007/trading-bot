@@ -1,179 +1,194 @@
 import os
-import csv
-import time
-from datetime import datetime
 import alpaca_trade_api as tradeapi
+import pandas as pd
+from datetime import datetime, time
+import pytz
 
-print("=== PHASE-4 PROFESSIONAL BOT START ===")
-
-# ==========================
-# Alpaca API Config
-# ==========================
+# =========================
+# CONFIG
+# =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"  # Change to live URL for live trading
+BASE_URL = "https://paper-api.alpaca.markets"
 
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
+RISK_PER_TRADE = 0.01
+MAX_TRADES_PER_DAY = 5
 
-# ==========================
-# Bot Config
-# ==========================
-TICKERS = [
-    # Top 200 tickers, example subset here
-    "AAPL","TSLA","NVDA","AMD","META","AMZN","MSFT","GOOGL",
-    "SPY","QQQ","INTC","F","GM","NFLX","BA","SHOP","SQ","PYPL",
-    "CRM","ORCL","IBM","V","MA","JNJ","PFE","MRNA","BNTX",
-    "UBER","LYFT","SNAP","TWTR","DIS","NKE","SBUX","MCD",
-    "COST","WMT","T","VZ","XOM","CVX","BP","TOT","RDS-A",
-    "CAT","DE","GS","JPM","BAC"
-]
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "META"]
 
-RISK_PER_TRADE = 0.01           # Max 1% equity per trade
-MOMENTUM_THRESHOLD = 0.003      # 0.3% momentum
-VOLUME_SURGE = 1.5              # 50% above avg volume
-VOLATILITY_THRESHOLD = 0.02     # Max 2% intrabar volatility
-STOP_LOSS = 0.97                 # 3% stop
-TRAILING_STOP = 0.98             # 2% trailing stop
-TAKE_PROFIT = 1.05               # 5% profit
-TIMEFRAME = "5Min"
-DAILY_RISK_LIMIT = 0.05          # Max 5% equity loss per day
-MAX_TRADES_PER_DAY = 10
-LOG_FILE = "phase4_trades_log.csv"
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-# ==========================
-# Utility Functions
-# ==========================
-def market_open():
-    try:
-        return api.get_clock().is_open
-    except Exception as e:
-        print("Clock error:", e)
-        return False
+trades_today = 0
+open_positions = {}
 
-def account_equity():
-    try:
-        return float(api.get_account().equity)
-    except Exception as e:
-        print("Account error:", e)
-        return 10000.0  # fallback
+# =========================
+# TIME FILTER
+# =========================
+def valid_trading_time():
+    est = pytz.timezone('US/Eastern')
+    now = datetime.now(est).time()
 
-def position_exists(symbol):
-    try:
-        api.get_position(symbol)
-        return True
-    except:
-        return False
+    return (
+        time(9, 35) <= now <= time(11, 30)
+        or time(15, 0) <= now <= time(15, 50)
+    )
 
-def get_latest_price(symbol):
-    try:
-        bar = api.get_latest_bar(symbol)
-        return float(bar.c)
-    except Exception as e:
-        print(f"Price error {symbol}:", e)
+# =========================
+# MARKET TREND FILTER
+# =========================
+def market_trending():
+    bars = api.get_bars("SPY", "5Min", limit=20).df
+    ema = bars['close'].ewm(span=9).mean()
+    return bars['close'].iloc[-1] > ema.iloc[-1]
+
+# =========================
+# SIGNAL
+# =========================
+def get_signal(symbol):
+    bars = api.get_bars(symbol, "5Min", limit=30).df
+
+    if len(bars) < 20:
         return None
 
-def get_previous_price(symbol):
-    try:
-        bars = api.get_bars(symbol, TIMEFRAME, limit=2).df
-        if len(bars) < 2:
-            return None
-        return float(bars.close.iloc[-2])
-    except Exception as e:
-        print(f"Previous price error {symbol}:", e)
-        return None
+    high = bars['high'].rolling(20).max().iloc[-2]
+    price = bars['close'].iloc[-1]
 
-def get_avg_volume(symbol, lookback=20):
-    try:
-        bars = api.get_bars(symbol, TIMEFRAME, limit=lookback).df
-        return bars.volume.mean()
-    except Exception as e:
-        print(f"Volume error {symbol}:", e)
-        return None
+    avg_vol = bars['volume'].rolling(20).mean().iloc[-2]
+    vol = bars['volume'].iloc[-1]
 
-def calculate_qty(symbol):
-    equity = account_equity()
-    price = get_latest_price(symbol)
-    if price is None or price == 0:
-        return 0
-    risk_amount = equity * RISK_PER_TRADE
-    qty = int(risk_amount / price)
+    rel_vol = vol / avg_vol if avg_vol > 0 else 0
+
+    if price > high and rel_vol > 1.5:
+        return price
+
+    return None
+
+# =========================
+# POSITION SIZE
+# =========================
+def position_size(price):
+    equity = float(api.get_account().equity)
+    risk = equity * RISK_PER_TRADE
+
+    stop_distance = price * 0.05  # 5% stop
+    qty = int(risk / stop_distance)
+
     return max(qty, 1)
 
-def log_trade(symbol, action, price, qty):
-    with open(LOG_FILE, mode='a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.utcnow().isoformat(), symbol, action, price, qty])
+# =========================
+# ENTER TRADE (WITH HARD STOP)
+# =========================
+def enter_trade(symbol, price):
+    global trades_today
 
-# ==========================
-# Strategy Checks
-# ==========================
-def check_stop_take_trailing():
+    if trades_today >= MAX_TRADES_PER_DAY:
+        return
+
+    qty = position_size(price)
+
+    stop_loss = round(price * 0.95, 2)   # 5% visible stop
+    take_profit = round(price * 1.10, 2) # wide TP (bot exits earlier anyway)
+
     try:
-        positions = api.list_positions()
-        for p in positions:
-            entry = float(p.avg_entry_price)
-            current = float(p.current_price)
-            qty = p.qty
-            # Stop-loss
-            if current < entry * STOP_LOSS:
-                print(f"STOP LOSS {p.symbol}")
-                api.submit_order(symbol=p.symbol, qty=qty, side="sell", type="market", time_in_force="day")
-                log_trade(p.symbol, "SELL_STOP", current, qty)
-            # Take-profit
-            elif current > entry * TAKE_PROFIT:
-                print(f"TAKE PROFIT {p.symbol}")
-                api.submit_order(symbol=p.symbol, qty=qty, side="sell", type="market", time_in_force="day")
-                log_trade(p.symbol, "SELL_PROFIT", current, qty)
-            # Trailing stop
-            elif current < entry * TRAILING_STOP:
-                print(f"TRAILING STOP {p.symbol}")
-                api.submit_order(symbol=p.symbol, qty=qty, side="sell", type="market", time_in_force="day")
-                log_trade(p.symbol, "SELL_TRAIL", current, qty)
-    except Exception as e:
-        print("Stop/take check failed:", e)
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side='buy',
+            type='market',
+            time_in_force='day',
+            order_class='bracket',
+            stop_loss={'stop_price': stop_loss},
+            take_profit={'limit_price': take_profit}
+        )
 
-def check_momentum_volume(symbol):
-    price_now = get_latest_price(symbol)
-    price_prev = get_previous_price(symbol)
-    avg_vol = get_avg_volume(symbol)
-    if None in (price_now, price_prev, avg_vol):
+        open_positions[symbol] = {
+            "entry": price,
+            "time": datetime.now(),
+        }
+
+        trades_today += 1
+        print(f"ENTERED: {symbol} @ {price}")
+
+    except Exception as e:
+        print(f"ENTRY ERROR: {e}")
+
+# =========================
+# SMART EXIT (HIDDEN)
+# =========================
+def check_exit(symbol):
+    bars = api.get_bars(symbol, "5Min", limit=10).df
+
+    if symbol not in open_positions:
         return False
-    momentum = (price_now - price_prev) / price_prev
-    vol_bar = api.get_bars(symbol, TIMEFRAME, limit=1).df.volume.iloc[-1]
-    # Volatility filter
-    if abs(momentum) > VOLATILITY_THRESHOLD:
-        return False
-    if momentum > MOMENTUM_THRESHOLD and vol_bar > avg_vol * VOLUME_SURGE:
-        print(symbol, "momentum:", round(momentum,4), "volume surge:", round(vol_bar/avg_vol,2))
+
+    entry = open_positions[symbol]["entry"]
+    price = bars['close'].iloc[-1]
+
+    ema = bars['close'].ewm(span=5).mean().iloc[-1]
+
+    # 1) Momentum loss
+    if price < ema:
         return True
+
+    # 2) Profit capture (~3–5%)
+    if price > entry * 1.04:
+        return True
+
+    # 3) Time decay
+    held_minutes = (datetime.now() - open_positions[symbol]["time"]).seconds / 60
+    if held_minutes > 30:
+        return True
+
     return False
 
-# ==========================
-# Main Bot Loop
-# ==========================
-def run_bot():
-    if not market_open():
-        print("Market closed")
-        return
-    check_stop_take_trailing()
-    trades_today = 0
-    for symbol in TICKERS:
-        if trades_today >= MAX_TRADES_PER_DAY:
-            print("Max trades reached today")
-            break
-        try:
-            if position_exists(symbol):
-                continue
-            if check_momentum_volume(symbol):
-                qty = calculate_qty(symbol)
-                if qty > 0:
-                    print(f"BUYING {symbol} qty {qty}")
-                    api.submit_order(symbol=symbol, qty=qty, side="buy", type="market", time_in_force="day")
-                    log_trade(symbol, "BUY", get_latest_price(symbol), qty)
-                    trades_today += 1
-        except Exception as e:
-            print(f"Error scanning {symbol}:", e)
-            time.sleep(1)
+# =========================
+# EXIT TRADE
+# =========================
+def exit_trade(symbol):
+    try:
+        position = api.get_position(symbol)
 
+        api.submit_order(
+            symbol=symbol,
+            qty=position.qty,
+            side='sell',
+            type='market',
+            time_in_force='day'
+        )
+
+        if symbol in open_positions:
+            del open_positions[symbol]
+
+        print(f"EXITED EARLY: {symbol}")
+
+    except Exception as e:
+        print(f"EXIT ERROR: {e}")
+
+# =========================
+# MAIN
+# =========================
+def run_bot():
+    if not valid_trading_time():
+        print("Outside trading window")
+        return
+
+    if not market_trending():
+        print("Market not trending")
+        return
+
+    # Manage positions
+    for symbol in list(open_positions.keys()):
+        if check_exit(symbol):
+            exit_trade(symbol)
+
+    # New trades
+    for symbol in SYMBOLS:
+        if symbol not in open_positions:
+            signal = get_signal(symbol)
+            if signal:
+                enter_trade(symbol, signal)
+
+if __name__ == "__main__":
+    run_bot()
 run_bot()
 print("=== PHASE-4 PROFESSIONAL BOT COMPLETE ===")
