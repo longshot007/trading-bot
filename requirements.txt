@@ -3,3 +3,10 @@ pandas
 yfinance
 numpy
 schedule
+alpaca-trade-api
+pandas
+numpy
+xgboost
+joblib
+flask
+requests
