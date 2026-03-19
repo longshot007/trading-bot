@@ -1,179 +1,222 @@
+# ==========================
+# Phase 5 Quant Trading Bot (Telegram Removed, Local Logging Only)
+# ==========================
+# ADDED:
+# - Real-time PnL tracking
+# - Auto nightly retraining
+# - Symbol rotation (stop trading weak tickers)
+# - Performance-based strategy weighting
+# - Local logging instead of Telegram notifications
+# ==========================
 
-
-import os
-import requests
+import alpaca_trade_api as tradeapi
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
+from xgboost import XGBClassifier
+import joblib
+import os
+import threading
+import time
 
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+# ==========================
+# CONFIG
+# ==========================
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_SECRET_KEY"
 BASE_URL = "https://paper-api.alpaca.markets"
-DATA_URL = "https://data.alpaca.markets"
 
-HEADERS = {
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET
-}
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD"]
+performance_scores = {s:1.0 for s in SYMBOLS}
+MARKET_SYMBOL = "SPY"
+TIMEFRAME = "1Min"
+LOOKBACK = 1000
+MODEL_PATH = "model.pkl"
 
-MAX_POSITIONS = 5
-POSITION_SIZE = 0.2  # 20% per trade
-MAX_HOLD_MINUTES = 45
-PROFIT_TARGET = 0.01  # 1%
-STOP_LOSS = -0.007   # -0.7%
-MIN_VOLATILITY = 0.003
+RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = 0.03
+MAX_TRADES_PER_DAY = 10
+PROB_THRESHOLD = 0.65
 
-# ----------------------
-# Helpers
-# ----------------------
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-def get_account():
-    r = requests.get(f"{BASE_URL}/v2/account", headers=HEADERS)
-    return r.json()
+trade_count = 0
+start_equity = None
+pnl_tracker = {}
 
+# ==========================
+# LOGGING
+# ==========================
+def log_message(msg):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open("trades.log", "a") as f:
+        f.write(f"{timestamp} {msg}\n")
+    print(msg)
 
-def get_positions():
-    r = requests.get(f"{BASE_URL}/v2/positions", headers=HEADERS)
-    return r.json()
+# ==========================
+# DATA
+# ==========================
+def get_data(symbol):
+    bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
+    return bars[bars['symbol'] == symbol]
 
+# ==========================
+# FEATURES
+# ==========================
+def compute_features(df):
+    df = df.copy()
+    df['body'] = df['close'] - df['open']
+    df['range'] = df['high'] - df['low']
+    df['upper_wick'] = df['high'] - df[['open','close']].max(axis=1)
+    df['lower_wick'] = df[['open','close']].min(axis=1) - df['low']
 
-def get_bars(symbol):
-    end = datetime.utcnow()
-    start = end - timedelta(hours=6)
+    df['body_pct'] = df['body'] / df['range'].replace(0,1)
+    df['upper_wick_pct'] = df['upper_wick'] / df['range'].replace(0,1)
+    df['lower_wick_pct'] = df['lower_wick'] / df['range'].replace(0,1)
 
-    url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "start": start.isoformat() + "Z",
-        "end": end.isoformat() + "Z",
-        "timeframe": "5Min"
-    }
+    df['returns'] = df['close'].pct_change()
+    df['volatility'] = df['returns'].rolling(20).std()
+    df['volume_ratio'] = df['volume'] / df['volume'].rolling(20).mean()
 
-    r = requests.get(url, headers=HEADERS, params=params)
-    data = r.json()
+    df['vwap'] = (df['volume'] * (df['high']+df['low']+df['close'])/3).cumsum() / df['volume'].cumsum()
+    df['vwap_dist'] = (df['close'] - df['vwap']) / df['vwap']
 
-    if "bars" not in data:
-        return None
+    df['momentum'] = df['close'] - df['close'].shift(3)
+    df['acceleration'] = df['momentum'] - df['momentum'].shift(1)
 
-    df = pd.DataFrame(data["bars"])
-    return df
+    return df.dropna()
 
+# ==========================
+# TARGET
+# ==========================
+def create_target(df):
+    future_max = df['close'].rolling(3).max().shift(-3)
+    future_min = df['close'].rolling(3).min().shift(-3)
 
-def compute_volatility(df):
-    df['return'] = df['c'].pct_change()
-    return df['return'].std()
+    up_move = (future_max - df['close']) / df['close']
+    down_move = (df['close'] - future_min) / df['close']
 
+    df['target'] = (up_move > 0.0015) & (down_move < 0.0015)
+    return df.dropna()
 
-def compute_momentum(df):
-    return (df['c'].iloc[-1] - df['c'].iloc[0]) / df['c'].iloc[0]
+# ==========================
+# TRAIN
+# ==========================
+def train_model():
+    dfs = []
+    for s in SYMBOLS:
+        df = create_target(compute_features(get_data(s)))
+        dfs.append(df)
 
+    data = pd.concat(dfs)
+    features = ['body_pct','upper_wick_pct','lower_wick_pct','volatility','volume_ratio','vwap_dist','momentum','acceleration']
 
-def submit_order(symbol, qty, side):
-    order = {
-        "symbol": symbol,
-        "qty": qty,
-        "side": side,
-        "type": "market",
-        "time_in_force": "day"
-    }
-    requests.post(f"{BASE_URL}/v2/orders", json=order, headers=HEADERS)
+    model = XGBClassifier(n_estimators=300, max_depth=6)
+    model.fit(data[features], data['target'])
 
+    joblib.dump(model, MODEL_PATH)
+    log_message("Model retrained successfully")
 
-# ----------------------
-# Stock Selection
-# ----------------------
+# ==========================
+# AUTO RETRAIN
+# ==========================
+def retrain_scheduler():
+    while True:
+        now = datetime.now()
+        if now.hour == 2 and now.minute == 0:
+            train_model()
+        time.sleep(60)
 
-def get_watchlist():
-    return [
-        "AAPL", "TSLA", "NVDA", "AMD", "MSFT",
-        "META", "AMZN", "GOOGL", "NFLX", "SPY"
-    ]
+# ==========================
+# LOAD
+# ==========================
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        train_model()
+    return joblib.load(MODEL_PATH)
 
+# ==========================
+# SYMBOL ROTATION
+# ==========================
+def get_active_symbols():
+    sorted_symbols = sorted(performance_scores, key=performance_scores.get, reverse=True)
+    return sorted_symbols[:3]
 
-def pick_stocks():
-    candidates = []
+# ==========================
+# STRATEGY
+# ==========================
+def strategy_vote(df, model, symbol):
+    latest = df.iloc[-1:]
+    features = ['body_pct','upper_wick_pct','lower_wick_pct','volatility','volume_ratio','vwap_dist','momentum','acceleration']
 
-    for symbol in get_watchlist():
-        df = get_bars(symbol)
-        if df is None or len(df) < 10:
-            continue
+    ml_prob = model.predict_proba(latest[features])[0][1]
+    momentum_signal = latest['momentum'].values[0] > 0
+    vwap_signal = latest['vwap_dist'].values[0] > 0
 
-        vol = compute_volatility(df)
-        mom = compute_momentum(df)
+    weight = performance_scores[symbol]
+    score = (ml_prob * weight) + momentum_signal + vwap_signal
 
-        if vol < MIN_VOLATILITY:
-            continue
+    return score, ml_prob
 
-        candidates.append((symbol, mom, vol))
+# ==========================
+# EXECUTION + PnL TRACK
+# ==========================
+def place_trade(symbol, price, volatility):
+    qty = 1
+    order = api.submit_order(
+        symbol=symbol,
+        qty=qty,
+        side='buy',
+        type='market',
+        time_in_force='gtc'
+    )
+    pnl_tracker[symbol] = price
+    log_message(f"BUY {symbol} at {price}")
 
-    # Sort by momentum
-    candidates.sort(key=lambda x: x[1], reverse=True)
+# ==========================
+# CHECK POSITIONS
+# ==========================
+def check_positions():
+    positions = api.list_positions()
+    for pos in positions:
+        symbol = pos.symbol
+        entry = pnl_tracker.get(symbol, float(pos.avg_entry_price))
+        current = float(pos.current_price)
+        pnl = (current - entry) / entry
 
-    return [c[0] for c in candidates[:MAX_POSITIONS]]
+        if pnl > 0.002 or pnl < -0.002:
+            api.close_position(symbol)
+            if pnl > 0:
+                performance_scores[symbol] += 0.1
+            else:
+                performance_scores[symbol] -= 0.1
+            log_message(f"CLOSE {symbol} PnL: {pnl:.4f}")
 
-
-# ----------------------
-# Trading Logic
-# ----------------------
-
-def get_last_trade_price(symbol):
-    r = requests.get(f"{DATA_URL}/v2/stocks/{symbol}/trades/latest", headers=HEADERS)
-    return r.json()["trade"]["p"]
-
-
-def calculate_qty(cash, price):
-    return int((cash * POSITION_SIZE) / price)
-
-
-def should_exit(position):
-    entry_price = float(position['avg_entry_price'])
-    current_price = float(position['current_price'])
-    qty = float(position['qty'])
-
-    pnl = (current_price - entry_price) / entry_price
-
-    # Time-based exit (using placeholder since Alpaca doesn't store entry time directly)
-    # In production you'd track this externally
-
-    if pnl >= PROFIT_TARGET:
-        return True
-
-    if pnl <= STOP_LOSS:
-        return True
-
-    return False
-
-
+# ==========================
+# MAIN LOOP
+# ==========================
 def run_bot():
-    account = get_account()
-    cash = float(account['cash'])
+    model = load_model()
+    symbols = get_active_symbols()
 
-    positions = get_positions()
-    held_symbols = [p['symbol'] for p in positions]
-
-    # SELL LOGIC
-    for p in positions:
-        if should_exit(p):
-            print(f"Selling {p['symbol']}")
-            submit_order(p['symbol'], p['qty'], "sell")
-
-    # BUY LOGIC
-    if len(positions) >= MAX_POSITIONS:
-        return
-
-    picks = pick_stocks()
-
-    for symbol in picks:
-        if symbol in held_symbols:
+    for symbol in symbols:
+        df = compute_features(get_data(symbol))
+        if len(df) < 100:
             continue
 
-        price = get_last_trade_price(symbol)
-        qty = calculate_qty(cash, price)
+        score, prob = strategy_vote(df, model, symbol)
+        if score > 2:
+            price = df['close'].iloc[-1]
+            vol = df['volatility'].iloc[-1]
+            place_trade(symbol, price, vol)
 
-        if qty > 0:
-            print(f"Buying {symbol}")
-            submit_order(symbol, qty, "buy")
+    check_positions()
 
-
+# ==========================
+# ENTRY
+# ==========================
 if __name__ == "__main__":
-    run_bot()
-
+    threading.Thread(target=retrain_scheduler).start()
+    while True:
+        run_bot()
+        time.sleep(60)
