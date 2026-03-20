@@ -1,129 +1,24 @@
-# ==========================
-# Phase 5 Quant Trading Bot - Updated for Safe Execution
-# ==========================
+name: Trading Bot Phase 4
 
-import alpaca_trade_api as tradeapi
-import pandas as pd
-import numpy as np
-from datetime import datetime
-from xgboost import XGBClassifier
-import joblib
-import os
-import threading
-import time
+on:
+  schedule:
+    - cron: "*/5 13-20 * * 1-5"
+  workflow_dispatch:
 
-# ==========================
-# CONFIG
-# ==========================
-API_KEY = os.getenv('APCA_API_KEY_ID')
-API_SECRET = os.getenv('APCA_API_SECRET_KEY')
-BASE_URL = "https://paper-api.alpaca.markets"  # Ensure matches your key type
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
 
-SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD"]
-performance_scores = {s:1.0 for s in SYMBOLS}
-TIMEFRAME = "1Min"
-LOOKBACK = 1000
-MODEL_PATH = "model.pkl"
+    steps:
+      - uses: actions/checkout@v3
 
-RISK_PER_TRADE = 0.01
-MAX_DAILY_LOSS = 0.03
-MAX_TRADES_PER_DAY = 10
-PROB_THRESHOLD = 0.65
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
 
-trade_count = 0
-start_equity = None
-pnl_tracker = {}
+      - run: pip install pandas requests numpy
 
-# ==========================
-# LOGGING
-# ==========================
-def log_message(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with open("trades.log", "a") as f:
-        f.write(f"{timestamp} {msg}\n")
-    print(msg)
-
-# ==========================
-# DATA FETCH WITH ERROR HANDLING
-# ==========================
-def get_data(symbol):
-    try:
-        api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
-        bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
-        return bars[bars['symbol'] == symbol]
-    except Exception as e:
-        log_message(f"Error fetching data for {symbol}: {e}")
-        return pd.DataFrame()  # Return empty DataFrame to skip
-
-# ==========================
-# FEATURES & TARGET
-# ==========================
-def compute_features(df):
-    if df.empty:
-        return df
-    df = df.copy()
-    df['body'] = df['close'] - df['open']
-    df['range'] = df['high'] - df['low']
-    df['upper_wick'] = df['high'] - df[['open','close']].max(axis=1)
-    df['lower_wick'] = df[['open','close']].min(axis=1) - df['low']
-    df['body_pct'] = df['body'] / df['range'].replace(0,1)
-    df['upper_wick_pct'] = df['upper_wick'] / df['range'].replace(0,1)
-    df['lower_wick_pct'] = df['lower_wick'] / df['range'].replace(0,1)
-    df['returns'] = df['close'].pct_change()
-    df['volatility'] = df['returns'].rolling(20).std()
-    df['volume_ratio'] = df['volume'] / df['volume'].rolling(20).mean()
-    df['vwap'] = (df['volume'] * (df['high']+df['low']+df['close'])/3).cumsum() / df['volume'].cumsum()
-    df['vwap_dist'] = (df['close'] - df['vwap']) / df['vwap']
-    df['momentum'] = df['close'] - df['close'].shift(3)
-    df['acceleration'] = df['momentum'] - df['momentum'].shift(1)
-    return df.dropna()
-
-def create_target(df):
-    if df.empty:
-        return df
-    future_max = df['close'].rolling(3).max().shift(-3)
-    future_min = df['close'].rolling(3).min().shift(-3)
-    up_move = (future_max - df['close']) / df['close']
-    down_move = (df['close'] - future_min) / df['close']
-    df['target'] = (up_move > 0.0015) & (down_move < 0.0015)
-    return df.dropna()
-
-# ==========================
-# TRAINING & LOADING MODEL
-# ==========================
-def train_model():
-    dfs = []
-    for s in SYMBOLS:
-        df = create_target(compute_features(get_data(s)))
-        if not df.empty:
-            dfs.append(df)
-    if dfs:
-        data = pd.concat(dfs)
-        features = ['body_pct','upper_wick_pct','lower_wick_pct','volatility','volume_ratio','vwap_dist','momentum','acceleration']
-        model = XGBClassifier(n_estimators=300, max_depth=6)
-        model.fit(data[features], data['target'])
-        joblib.dump(model, MODEL_PATH)
-        log_message("Model retrained successfully")
-
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        train_model()
-    return joblib.load(MODEL_PATH)
-
-# ==========================
-# MAIN LOOP
-# ==========================
-def run_bot():
-    model = load_model()
-    for symbol in SYMBOLS:
-        df = compute_features(get_data(symbol))
-        if df.empty or len(df) < 100:
-            continue
-        # Place trades etc.
-        log_message(f"Data fetched and features computed for {symbol}")
-
-if __name__ == '__main__':
-    try:
-        run_bot()
-    except Exception as e:
-        log_message(f"Bot stopped due to error: {e}")
+      - run: python bot.py
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
