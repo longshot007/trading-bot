@@ -1,8 +1,8 @@
-name: Trading Bot Phase 4
+name: Trading Bot
 
 on:
   schedule:
-    - cron: "*/5 13-20 * * 1-5"
+    - cron: "*/15 14-21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -10,15 +10,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - run: pip install pandas requests numpy
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install alpaca-trade-api pandas numpy
 
-      - run: python bot.py
+      - name: Run bot
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+          APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
+        run: python bot.py
