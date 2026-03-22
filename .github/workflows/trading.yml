@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install alpaca-trade-api pandas numpy
+          pip install alpaca-trade-api pandas numpy scikit-learn joblib
 
       - name: Run bot
         env:
