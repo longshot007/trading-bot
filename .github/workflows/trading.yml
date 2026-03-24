@@ -1,8 +1,8 @@
-name: Trading Bot
+name: Trading Bot Phase 9.5
 
 on:
   schedule:
-    - cron: "*/15 14-21 * * 1-5"
+    - cron: "*/10 14-21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -22,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install alpaca-trade-api pandas numpy scikit-learn joblib
+          pip install alpaca-trade-api pandas numpy scikit-learn matplotlib
 
       - name: Run bot
         env:
@@ -30,3 +29,16 @@ jobs:
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
         run: python bot.py
+
+      - name: Upload bot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-bot-phase95
+          path: |
+            data/**
+            logs/**
+            models/**
+            state/**
+            dashboard/**
+          if-no-files-found: ignore
