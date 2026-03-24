@@ -1,9 +1,8 @@
 import os
 import json
 import math
-import time
 import pickle
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -11,10 +10,16 @@ import pandas as pd
 import alpaca_trade_api as tradeapi
 from sklearn.ensemble import RandomForestClassifier
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
 
 # ============================================================
-# PHASE 9 - ADAPTIVE LEARNING BOT
-# Persistent rolling learning + capped storage + 48+ signals
+# PHASE 9.5 - ADAPTIVE INTRADAY BOT + VISUAL DASHBOARD
+# Broad scanner + multi-stage filtering + foundational signal engine
+# + vetting + minute-level exits + full logging + HTML dashboard
 # ============================================================
 
 # -------------------------
@@ -35,39 +40,50 @@ api = tradeapi.REST(API_KEY, API_SECRET, API_BASE_URL, api_version="v2")
 # -------------------------
 TIMEFRAME = tradeapi.TimeFrame.Minute
 LOOKBACK_BARS = 260
-LABEL_HORIZON = 8
-LABEL_THRESHOLD = 0.0025        # 0.25% future move
+DASHBOARD_BARS = 120
+LABEL_HORIZON = 6
+LABEL_THRESHOLD = 0.0022
 MIN_TRAIN_ROWS = 400
 MAX_TRAIN_ROWS = 5000
-MAX_TRADE_HISTORY_ROWS = 500
-MAX_CANDIDATES = 10
+MAX_TRADE_HISTORY_ROWS = 800
+MAX_CANDIDATE_LOG_ROWS = 3000
+MAX_ACCOUNT_SNAPSHOT_ROWS = 1000
 MAX_POSITIONS = 4
-MAX_ALLOC_PER_POSITION = 0.22
-CASH_RESERVE = 0.08
+MAX_CANDIDATES = 12
+MAX_STAGE1_SYMBOLS = 28
+MAX_ALLOC_PER_POSITION = 0.18
+CASH_RESERVE = 0.10
 MIN_PRICE = 7.0
-MAX_PRICE = 300.0
+MAX_PRICE = 350.0
 MIN_DOLLAR_VOLUME = 5_000_000
-MIN_PROB_TO_BUY = 0.57
-PROB_SELL_FLOOR = 0.45
+MIN_PROB_TO_BUY = 0.58
+PROB_SELL_FLOOR = 0.46
 
-STOP_LOSS_PCT = 0.018
-TAKE_PROFIT_PCT = 0.03
-TRAIL_ACTIVATE_PCT = 0.015
-TRAIL_GIVEBACK_PCT = 0.008
-MAX_HOLD_MINUTES = 180
+STOP_LOSS_PCT = 0.012
+TAKE_PROFIT_PCT = 0.018
+TRAIL_ACTIVATE_PCT = 0.010
+TRAIL_GIVEBACK_PCT = 0.006
+MAX_HOLD_MINUTES = 45
 MIN_ORDER_NOTIONAL = 25.0
 RETRAIN_EVERY_N_NEW_ROWS = 250
 RANDOM_STATE = 42
 
-SEC_FEE_RATE = 0.0000206   # user-required fee model on sells
+SEC_FEE_RATE = 0.0000206
 TRADING_FEE_BUFFER = 0.0005
 
-UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "TSLA", "GOOGL",
-    "NFLX", "AVGO", "PLTR", "SMCI", "MU", "UBER", "CRM", "ORCL",
-    "INTC", "QCOM", "SHOP", "SQ", "PANW", "CRWD", "SNOW", "COIN",
-    "ARM", "ADBE", "PYPL", "TTD", "MRVL", "NOW"
-]
+# Step 1: broader but still GitHub-safe liquid universe
+UNIVERSE = sorted(list({
+    "AAPL","MSFT","NVDA","AMD","AMZN","META","TSLA","GOOGL","NFLX","AVGO",
+    "PLTR","SMCI","MU","UBER","CRM","ORCL","INTC","QCOM","SHOP","SQ","PANW",
+    "CRWD","SNOW","COIN","ARM","ADBE","PYPL","TTD","MRVL","NOW","ABNB","ANET",
+    "APP","ASML","AXON","BA","BABA","BKNG","CCL","CELH","CFLT","COST","DASH",
+    "DELL","DKNG","DOCU","DUOL","ETSY","GE","GS","HIMS","HOOD","INTU","ISRG",
+    "KLAC","LRCX","LULU","MDB","MELI","MSTR","NET","NKE","OKTA","ON","PATH",
+    "PDD","RBLX","RDDT","RIOT","ROKU","ROST","SBUX","SERV","SOFI","SPOT","TEAM",
+    "TEM","TMUS","TSM","UPST","V","WMT","ZS","ZM","AI","IOT","DDOG","FSLR",
+    "GTLB","NVO","RIVN","ALAB","HUBS","CHWY","WDAY","MNDY","CPNG","DOCN"
+}))
+
 
 # -------------------------
 # Storage
@@ -77,15 +93,23 @@ DATA_DIR = ROOT / "data"
 MODELS_DIR = ROOT / "models"
 LOGS_DIR = ROOT / "logs"
 STATE_DIR = ROOT / "state"
+DASHBOARD_DIR = ROOT / "dashboard"
+CHARTS_DIR = DASHBOARD_DIR / "charts"
 
-for p in [DATA_DIR, MODELS_DIR, LOGS_DIR, STATE_DIR]:
+for p in [DATA_DIR, MODELS_DIR, LOGS_DIR, STATE_DIR, DASHBOARD_DIR, CHARTS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 TRAIN_DATA_FILE = DATA_DIR / "train_data.csv"
 TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
-MODEL_FILE = MODELS_DIR / "phase9_model.pkl"
-MODEL_META_FILE = MODELS_DIR / "phase9_model_meta.json"
+CANDIDATE_LOG_FILE = DATA_DIR / "candidate_log.csv"
+ENTRY_LOG_FILE = DATA_DIR / "entry_log.csv"
+EXIT_LOG_FILE = DATA_DIR / "exit_log.csv"
+ACCOUNT_SNAPSHOT_FILE = DATA_DIR / "account_snapshot.csv"
+
+MODEL_FILE = MODELS_DIR / "phase95_model.pkl"
+MODEL_META_FILE = MODELS_DIR / "phase95_model_meta.json"
 OPEN_STATE_FILE = STATE_DIR / "open_positions.json"
+LAST_RUN_FILE = STATE_DIR / "last_run_summary.json"
 RUN_LOG_FILE = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d')}.log"
 
 
@@ -107,10 +131,6 @@ def safe_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
-
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def load_json(path: Path, default):
@@ -198,6 +218,7 @@ def cancel_open_orders(symbol: str = None) -> None:
 
 # -------------------------
 # Indicators / signal helpers
+# Step 3 foundation: reusable book-derived signal engine
 # -------------------------
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -332,27 +353,27 @@ def detect_candles(df: pd.DataFrame) -> pd.DataFrame:
     out["cdl_outside_bar"] = ((h > h.shift(1)) & (l < l.shift(1))).astype(int)
 
     out["cdl_morning_star"] = (
-        (c.shift(2) < o.shift(2)) &
-        ((c.shift(1) - o.shift(1)).abs() < (h.shift(1) - l.shift(1)) * 0.2) &
-        (c > o) &
-        (c > ((o.shift(2) + c.shift(2)) / 2))
+        (c.shift(2) < o.shift(2))
+        & ((c.shift(1) - o.shift(1)).abs() < (h.shift(1) - l.shift(1)) * 0.2)
+        & (c > o)
+        & (c > ((o.shift(2) + c.shift(2)) / 2))
     ).astype(int)
 
     out["cdl_evening_star"] = (
-        (c.shift(2) > o.shift(2)) &
-        ((c.shift(1) - o.shift(1)).abs() < (h.shift(1) - l.shift(1)) * 0.2) &
-        (c < o) &
-        (c < ((o.shift(2) + c.shift(2)) / 2))
+        (c.shift(2) > o.shift(2))
+        & ((c.shift(1) - o.shift(1)).abs() < (h.shift(1) - l.shift(1)) * 0.2)
+        & (c < o)
+        & (c < ((o.shift(2) + c.shift(2)) / 2))
     ).astype(int)
 
     out["cdl_three_white_soldiers"] = (
-        (c > o) & (c.shift(1) > o.shift(1)) & (c.shift(2) > o.shift(2)) &
-        (c > c.shift(1)) & (c.shift(1) > c.shift(2))
+        (c > o) & (c.shift(1) > o.shift(1)) & (c.shift(2) > o.shift(2))
+        & (c > c.shift(1)) & (c.shift(1) > c.shift(2))
     ).astype(int)
 
     out["cdl_three_black_crows"] = (
-        (c < o) & (c.shift(1) < o.shift(1)) & (c.shift(2) < o.shift(2)) &
-        (c < c.shift(1)) & (c.shift(1) < c.shift(2))
+        (c < o) & (c.shift(1) < o.shift(1)) & (c.shift(2) < o.shift(2))
+        & (c < c.shift(1)) & (c.shift(1) < c.shift(2))
     ).astype(int)
 
     return out
@@ -584,8 +605,7 @@ def rebuild_symbol_training_data(symbol: str) -> pd.DataFrame:
     if bars.empty:
         return pd.DataFrame()
     feats = build_features(bars)
-    train_rows = make_training_rows(feats)
-    return train_rows
+    return make_training_rows(feats)
 
 
 def update_training_store(symbols) -> int:
@@ -602,16 +622,14 @@ def update_training_store(symbols) -> int:
         return 0
 
     batch = pd.concat(parts, ignore_index=True)
-    batch["timestamp"] = pd.to_datetime(batch["timestamp"], utc=True)
-    batch["timestamp"] = batch["timestamp"].astype(str)
+    batch["timestamp"] = pd.to_datetime(batch["timestamp"], utc=True).astype(str)
 
-    n = append_df(
+    return append_df(
         TRAIN_DATA_FILE,
         batch,
         dedupe_cols=["symbol", "timestamp"],
-        max_rows=MAX_TRAIN_ROWS
+        max_rows=MAX_TRAIN_ROWS,
     )
-    return n
 
 
 def load_training_data() -> pd.DataFrame:
@@ -633,13 +651,16 @@ def load_model():
 
 
 def load_model_meta():
-    return load_json(MODEL_META_FILE, default={
-        "trained_at": None,
-        "train_rows": 0,
-        "new_rows_since_train": 0,
-        "feature_count": len(FEATURE_COLUMNS),
-        "model_type": "RandomForestClassifier"
-    })
+    return load_json(
+        MODEL_META_FILE,
+        default={
+            "trained_at": None,
+            "train_rows": 0,
+            "new_rows_since_train": 0,
+            "feature_count": len(FEATURE_COLUMNS),
+            "model_type": "RandomForestClassifier",
+        },
+    )
 
 
 def save_model(model, meta: dict) -> None:
@@ -656,30 +677,31 @@ def train_or_load_model(force=False):
     need_train = force or model is None
     if meta.get("new_rows_since_train", 0) >= RETRAIN_EVERY_N_NEW_ROWS:
         need_train = True
-    if len(train_df) < MIN_TRAIN_ROWS:
-        need_train = False if model is not None else False
+
+    if len(train_df) < MIN_TRAIN_ROWS and model is None:
+        log(f"Not enough train rows yet: {len(train_df)}")
+        return None, meta
 
     if not need_train and model is not None:
         return model, meta
 
     if len(train_df) < MIN_TRAIN_ROWS:
-        log(f"Not enough train rows yet: {len(train_df)}")
+        log(f"Not enough train rows to retrain yet: {len(train_df)}")
         return model, meta
 
     X = train_df[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     y = train_df["target"].astype(int)
 
-    class_balance = y.mean()
-    log(f"Training model on {len(train_df)} rows | positive rate={class_balance:.3f}")
+    log(f"Training model on {len(train_df)} rows | positive rate={y.mean():.3f}")
 
     model = RandomForestClassifier(
-        n_estimators=300,
+        n_estimators=280,
         max_depth=8,
         min_samples_leaf=12,
         min_samples_split=20,
         random_state=RANDOM_STATE,
         n_jobs=-1,
-        class_weight="balanced_subsample"
+        class_weight="balanced_subsample",
     )
     model.fit(X, y)
 
@@ -688,7 +710,7 @@ def train_or_load_model(force=False):
         "train_rows": int(len(train_df)),
         "new_rows_since_train": 0,
         "feature_count": len(FEATURE_COLUMNS),
-        "model_type": "RandomForestClassifier"
+        "model_type": "RandomForestClassifier",
     }
     save_model(model, meta)
     return model, meta
@@ -700,8 +722,7 @@ def train_or_load_model(force=False):
 def load_trade_history() -> pd.DataFrame:
     if not TRADE_HISTORY_FILE.exists():
         return pd.DataFrame()
-    df = pd.read_csv(TRADE_HISTORY_FILE)
-    return df
+    return pd.read_csv(TRADE_HISTORY_FILE)
 
 
 def adaptive_buy_threshold() -> float:
@@ -719,7 +740,7 @@ def adaptive_buy_threshold() -> float:
     elif win_rate > 0.60 and avg_pnl > 0.003:
         threshold -= 0.02
 
-    return max(0.54, min(0.65, threshold))
+    return max(0.55, min(0.67, threshold))
 
 
 # -------------------------
@@ -747,7 +768,8 @@ def sync_open_state_with_broker():
                 "entry_price": safe_float(pos.avg_entry_price, 0.0),
                 "qty": safe_float(pos.qty, 0.0),
                 "highest_price": safe_float(pos.current_price, safe_float(pos.avg_entry_price, 0.0)),
-                "entry_score": None
+                "entry_score": None,
+                "entry_reason": "synced_from_broker",
             }
 
     save_open_state(state)
@@ -755,75 +777,285 @@ def sync_open_state_with_broker():
 
 
 # -------------------------
-# Candidate scoring
+# Step 2: multi-stage scan
 # -------------------------
-def latest_feature_row(symbol: str) -> pd.Series | None:
+def quick_scan(symbol: str):
+    bars = get_bars(symbol, 70)
+    if bars.empty or len(bars) < 45:
+        return None
+
+    last = bars.iloc[-1]
+    close_px = safe_float(last["close"], 0.0)
+    if close_px < MIN_PRICE or close_px > MAX_PRICE:
+        return None
+
+    bars["dollar_volume"] = bars["close"] * bars["volume"]
+    dollar_volume_ma20 = safe_float(bars["dollar_volume"].tail(20).mean(), 0.0)
+    if dollar_volume_ma20 < MIN_DOLLAR_VOLUME:
+        return None
+
+    ret20 = safe_float((bars["close"].iloc[-1] / bars["close"].iloc[-21] - 1.0) if len(bars) > 20 else 0.0, 0.0)
+    relvol = safe_float(last["volume"] / bars["volume"].tail(20).mean(), 1.0)
+    intrabar_range = safe_float((last["high"] - last["low"]) / last["close"], 0.0)
+
+    if intrabar_range < 0.002:
+        return None
+
+    return {
+        "symbol": symbol,
+        "close": close_px,
+        "dollar_volume_ma20": dollar_volume_ma20,
+        "ret20": ret20,
+        "relvol": relvol,
+        "intrabar_range": intrabar_range,
+    }
+
+
+def build_stage1_universe(symbols):
+    rows = []
+    for s in symbols:
+        try:
+            r = quick_scan(s)
+            if r:
+                rows.append(r)
+        except Exception as e:
+            log(f"Quick scan failed for {s}: {e}")
+
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows)
+    df["rank_score"] = (
+        df["relvol"].clip(0, 5) * 0.45
+        + df["intrabar_range"].clip(0, 0.08) * 8.0
+        + df["ret20"].clip(-0.2, 0.2) * 1.5
+    )
+    return df.sort_values("rank_score", ascending=False).head(MAX_STAGE1_SYMBOLS)["symbol"].tolist()
+
+
+# -------------------------
+# Step 4: vetting + scoring
+# -------------------------
+def reason_flags(row: pd.Series):
+    reasons_yes = []
+    reasons_no = []
+
+    if safe_float(row.get("ema_slope_21")) > 0:
+        reasons_yes.append("EMA21 rising")
+    else:
+        reasons_no.append("EMA21 flat/down")
+
+    if safe_float(row.get("session_vwap_dist")) > 0:
+        reasons_yes.append("Above session VWAP")
+    else:
+        reasons_no.append("Below session VWAP")
+
+    if safe_float(row.get("rel_volume_20")) >= 1.05:
+        reasons_yes.append("Volume expansion")
+    else:
+        reasons_no.append("Weak relative volume")
+
+    if safe_float(row.get("adx_14")) >= 16:
+        reasons_yes.append("Trend strength OK")
+    else:
+        reasons_no.append("Weak ADX")
+
+    if safe_float(row.get("dist_resistance_20")) >= 0.006:
+        reasons_yes.append("Room to resistance")
+    else:
+        reasons_no.append("Too near resistance")
+
+    if safe_float(row.get("zscore_20")) <= 2.2:
+        reasons_yes.append("Not overextended")
+    else:
+        reasons_no.append("Overextended")
+
+    if safe_float(row.get("bb_width")) <= 0.12:
+        reasons_yes.append("Compression structure")
+    else:
+        reasons_no.append("Wide/loose structure")
+
+    if int(safe_float(row.get("cdl_bull_engulf"))) == 1:
+        reasons_yes.append("Bull engulf")
+    if int(safe_float(row.get("cdl_hammer"))) == 1:
+        reasons_yes.append("Hammer")
+    if int(safe_float(row.get("breakout_20_up"))) == 1:
+        reasons_yes.append("20-bar breakout")
+    if int(safe_float(row.get("cdl_bear_engulf"))) == 1:
+        reasons_no.append("Bear engulf present")
+
+    return reasons_yes, reasons_no
+
+
+def latest_feature_row(symbol: str):
     bars = get_bars(symbol, LOOKBACK_BARS)
     if bars.empty:
-        return None
+        return None, None
     feats = build_features(bars)
     if feats.empty:
-        return None
+        return None, None
     row = feats.iloc[-1].copy()
 
     dollar_volume = safe_float(row.get("dollar_volume_ma20", 0.0))
     close_px = safe_float(row.get("close", 0.0))
     if close_px < MIN_PRICE or close_px > MAX_PRICE:
-        return None
+        return None, None
     if dollar_volume < MIN_DOLLAR_VOLUME:
+        return None, None
+    return row, bars
+
+
+def evaluate_candidate(model, symbol: str):
+    row, bars = latest_feature_row(symbol)
+    if row is None:
         return None
-    return row
+
+    X = pd.DataFrame([row[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)])
+    try:
+        prob = float(model.predict_proba(X)[0][1]) if model is not None else 0.5
+    except Exception:
+        prob = 0.5
+
+    reasons_yes, _ = reason_flags(row)
+    penalty = 0.0
+    boost = 0.0
+    reject_reasons = []
+
+    if safe_float(row["adx_14"]) < 12:
+        penalty += 0.02
+        reject_reasons.append("ADX too weak")
+    if safe_float(row["rel_volume_20"]) < 0.85:
+        penalty += 0.02
+        reject_reasons.append("Relative volume too weak")
+    if safe_float(row["dist_resistance_20"]) < 0.004:
+        penalty += 0.025
+        reject_reasons.append("Too close to resistance")
+    if safe_float(row["atr14_pct"]) > 0.045:
+        penalty += 0.02
+        reject_reasons.append("Volatility too high")
+    if safe_float(row["zscore_20"]) > 2.5:
+        penalty += 0.03
+        reject_reasons.append("Too extended")
+    if safe_float(row["ema_slope_21"]) <= 0:
+        penalty += 0.015
+        reject_reasons.append("EMA21 not rising")
+    if safe_float(row["session_vwap_dist"]) <= -0.002:
+        penalty += 0.02
+        reject_reasons.append("Below VWAP")
+    if safe_float(row["bb_width"]) > 0.18:
+        penalty += 0.01
+        reject_reasons.append("Structure too loose")
+
+    if safe_float(row["ema_slope_21"]) > 0:
+        boost += 0.01
+    if safe_float(row["session_vwap_dist"]) > 0:
+        boost += 0.01
+    if int(safe_float(row["cdl_bull_engulf"])) == 1 or int(safe_float(row["cdl_hammer"])) == 1:
+        boost += 0.01
+    if int(safe_float(row["breakout_20_up"])) == 1:
+        boost += 0.01
+    if safe_float(row["rel_volume_20"]) > 1.25:
+        boost += 0.01
+    if safe_float(row["dist_support_20"]) > 0.005:
+        boost += 0.005
+
+    final_prob = max(0.01, min(0.99, prob + boost - penalty))
+    accepted = len(reject_reasons) == 0
+
+    return {
+        "symbol": symbol,
+        "prob_raw": prob,
+        "prob": final_prob,
+        "price": safe_float(row["close"]),
+        "adx_14": safe_float(row["adx_14"]),
+        "atr14_pct": safe_float(row["atr14_pct"]),
+        "rel_volume_20": safe_float(row["rel_volume_20"]),
+        "session_vwap_dist": safe_float(row["session_vwap_dist"]),
+        "dist_resistance_20": safe_float(row["dist_resistance_20"]),
+        "zscore_20": safe_float(row["zscore_20"]),
+        "accepted": accepted,
+        "accept_reason": "; ".join(reasons_yes[:6]) if reasons_yes else "",
+        "reject_reason": "; ".join(reject_reasons) if reject_reasons else "",
+        "feature_row": row,
+        "bars": bars,
+    }
 
 
 def score_candidates(model, symbols):
     rows = []
     for s in symbols:
-        row = latest_feature_row(s)
-        if row is None:
-            continue
-        X = pd.DataFrame([row[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)])
         try:
-            prob = float(model.predict_proba(X)[0][1]) if model is not None else 0.5
-        except Exception:
-            prob = 0.5
-
-        # Hard filters: avoid obvious low-quality setups
-        if safe_float(row["adx_14"]) < 12:
-            prob -= 0.015
-        if safe_float(row["rel_volume_20"]) < 0.85:
-            prob -= 0.015
-        if safe_float(row["dist_resistance_20"]) < 0.004:
-            prob -= 0.02
-        if safe_float(row["atr14_pct"]) > 0.04:
-            prob -= 0.02
-
-        # Positive context boosts
-        if safe_float(row["ema_slope_21"]) > 0:
-            prob += 0.01
-        if safe_float(row["session_vwap_dist"]) > 0:
-            prob += 0.01
-        if int(safe_float(row["cdl_bull_engulf"])) == 1 or int(safe_float(row["cdl_hammer"])) == 1:
-            prob += 0.01
-        if int(safe_float(row["breakout_20_up"])) == 1:
-            prob += 0.01
-
-        rows.append({
-            "symbol": s,
-            "prob": prob,
-            "price": safe_float(row["close"]),
-            "atr14_pct": safe_float(row["atr14_pct"]),
-            "adx_14": safe_float(row["adx_14"]),
-            "rel_volume_20": safe_float(row["rel_volume_20"]),
-            "session_vwap_dist": safe_float(row["session_vwap_dist"]),
-            "dist_resistance_20": safe_float(row["dist_resistance_20"]),
-            "feature_row": row
-        })
+            result = evaluate_candidate(model, s)
+            if result:
+                rows.append(result)
+        except Exception as e:
+            log(f"Candidate eval failed for {s}: {e}")
 
     if not rows:
         return pd.DataFrame()
 
-    cands = pd.DataFrame(rows).sort_values("prob", ascending=False).head(MAX_CANDIDATES).reset_index(drop=True)
-    return cands
+    return pd.DataFrame(rows).sort_values("prob", ascending=False).head(MAX_CANDIDATES).reset_index(drop=True)
+
+
+# -------------------------
+# Logging snapshots
+# -------------------------
+def log_candidates(cands: pd.DataFrame, threshold: float) -> None:
+    if cands is None or cands.empty:
+        return
+    ts = datetime.utcnow().isoformat()
+    out = cands.copy()
+    out["logged_at"] = ts
+    out["buy_threshold"] = threshold
+    keep = [
+        "logged_at", "symbol", "prob_raw", "prob", "price", "adx_14", "rel_volume_20",
+        "session_vwap_dist", "dist_resistance_20", "zscore_20", "accepted",
+        "accept_reason", "reject_reason", "buy_threshold",
+    ]
+    append_df(CANDIDATE_LOG_FILE, out[keep], max_rows=MAX_CANDIDATE_LOG_ROWS)
+
+
+def log_entry(symbol: str, state_row: dict) -> None:
+    row = pd.DataFrame([
+        {
+            "logged_at": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "entry_time": state_row.get("entry_time"),
+            "entry_price": state_row.get("entry_price"),
+            "qty": state_row.get("qty"),
+            "entry_score": state_row.get("entry_score"),
+            "entry_reason": state_row.get("entry_reason"),
+        }
+    ])
+    append_df(ENTRY_LOG_FILE, row, max_rows=1000)
+
+
+def log_exit(symbol: str, exit_reason: str, exit_price: float, qty: float, entry_score=None, entry_reason=None) -> None:
+    row = pd.DataFrame([
+        {
+            "logged_at": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "exit_price": exit_price,
+            "qty": qty,
+            "exit_reason": exit_reason,
+            "entry_score": entry_score,
+            "entry_reason": entry_reason,
+        }
+    ])
+    append_df(EXIT_LOG_FILE, row, max_rows=1000)
+
+
+def log_account_snapshot() -> None:
+    positions = get_positions_dict()
+    snapshot = pd.DataFrame([
+        {
+            "snapshot_at": datetime.utcnow().isoformat(),
+            "cash": get_cash(),
+            "equity": get_equity(),
+            "positions": len(positions),
+        }
+    ])
+    append_df(ACCOUNT_SNAPSHOT_FILE, snapshot, max_rows=MAX_ACCOUNT_SNAPSHOT_ROWS)
 
 
 # -------------------------
@@ -834,13 +1066,7 @@ def submit_market_buy(symbol: str, qty: int) -> bool:
         return False
     try:
         cancel_open_orders(symbol)
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="buy",
-            type="market",
-            time_in_force="day"
-        )
+        api.submit_order(symbol=symbol, qty=qty, side="buy", type="market", time_in_force="day")
         log(f"BUY submitted: {symbol} qty={qty}")
         return True
     except Exception as e:
@@ -853,13 +1079,7 @@ def submit_market_sell(symbol: str, qty: int) -> bool:
         return False
     try:
         cancel_open_orders(symbol)
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="sell",
-            type="market",
-            time_in_force="day"
-        )
+        api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
         log(f"SELL submitted: {symbol} qty={qty}")
         return True
     except Exception as e:
@@ -869,8 +1089,7 @@ def submit_market_sell(symbol: str, qty: int) -> bool:
 
 def calc_sell_net_pnl_pct(entry_price: float, exit_price: float) -> float:
     gross = (exit_price / entry_price) - 1.0
-    sec_fee_pct = SEC_FEE_RATE
-    return gross - sec_fee_pct - TRADING_FEE_BUFFER
+    return gross - SEC_FEE_RATE - TRADING_FEE_BUFFER
 
 
 def update_trade_history_record(symbol: str, state_row: dict, exit_price: float, exit_reason: str) -> None:
@@ -879,6 +1098,7 @@ def update_trade_history_record(symbol: str, state_row: dict, exit_price: float,
     highest = safe_float(state_row.get("highest_price"), entry_price)
     entry_score = state_row.get("entry_score")
     entry_time = state_row.get("entry_time")
+    entry_reason = state_row.get("entry_reason")
 
     if entry_price <= 0 or qty <= 0:
         return
@@ -891,28 +1111,32 @@ def update_trade_history_record(symbol: str, state_row: dict, exit_price: float,
     hold_minutes = None
     try:
         et = pd.to_datetime(entry_time, utc=True)
-        hold_minutes = (pd.Timestamp.utcnow().tz_localize("UTC") - et).total_seconds() / 60.0
+        hold_minutes = (pd.Timestamp.now(tz="UTC") - et).total_seconds() / 60.0
     except Exception:
         pass
 
-    row = pd.DataFrame([{
-        "closed_at": datetime.utcnow().isoformat(),
-        "symbol": symbol,
-        "entry_time": entry_time,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
-        "qty": qty,
-        "highest_price": highest,
-        "entry_score": entry_score,
-        "gross_pnl": gross_pnl,
-        "sec_fee": sec_fee,
-        "est_other_cost": est_other_cost,
-        "net_pnl_pct": net_pnl_pct,
-        "hold_minutes": hold_minutes,
-        "exit_reason": exit_reason
-    }])
+    row = pd.DataFrame([
+        {
+            "closed_at": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "entry_time": entry_time,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "qty": qty,
+            "highest_price": highest,
+            "entry_score": entry_score,
+            "entry_reason": entry_reason,
+            "gross_pnl": gross_pnl,
+            "sec_fee": sec_fee,
+            "est_other_cost": est_other_cost,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "exit_reason": exit_reason,
+        }
+    ])
 
-    append_df(TRADE_HISTORY_FILE, row, dedupe_cols=None, max_rows=MAX_TRADE_HISTORY_ROWS)
+    append_df(TRADE_HISTORY_FILE, row, max_rows=MAX_TRADE_HISTORY_ROWS)
+    log_exit(symbol, exit_reason, exit_price, qty, entry_score=entry_score, entry_reason=entry_reason)
 
 
 def manage_positions(model) -> None:
@@ -935,7 +1159,7 @@ def manage_positions(model) -> None:
         held_minutes = 0.0
         try:
             et = pd.to_datetime(s.get("entry_time"), utc=True)
-            held_minutes = (pd.Timestamp.utcnow().tz_localize("UTC") - et).total_seconds() / 60.0
+            held_minutes = (pd.Timestamp.now(tz="UTC") - et).total_seconds() / 60.0
         except Exception:
             pass
 
@@ -955,9 +1179,8 @@ def manage_positions(model) -> None:
         elif held_minutes >= MAX_HOLD_MINUTES:
             exit_reason = "max_hold"
 
-        # Score deterioration exit
         if exit_reason is None and model is not None:
-            row = latest_feature_row(symbol)
+            row, _ = latest_feature_row(symbol)
             if row is not None:
                 X = pd.DataFrame([row[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)])
                 try:
@@ -969,37 +1192,42 @@ def manage_positions(model) -> None:
 
         state[symbol] = s
 
-        if exit_reason:
-            if submit_market_sell(symbol, qty):
-                update_trade_history_record(symbol, s, current_price, exit_reason)
-                state.pop(symbol, None)
+        if exit_reason and submit_market_sell(symbol, qty):
+            update_trade_history_record(symbol, s, current_price, exit_reason)
+            state.pop(symbol, None)
 
     save_open_state(state)
 
 
-def open_new_positions(model) -> None:
+def open_new_positions(model) -> pd.DataFrame:
     if model is None:
         log("No model available yet; skipping entries.")
-        return
+        return pd.DataFrame()
 
     threshold = adaptive_buy_threshold()
     positions = get_positions_dict()
     current_symbols = set(positions.keys())
-
     open_slots = max(0, MAX_POSITIONS - len(current_symbols))
     if open_slots <= 0:
         log("No open slots available.")
-        return
+        return pd.DataFrame()
 
-    cands = score_candidates(model, [s for s in UNIVERSE if s not in current_symbols])
+    stage1_symbols = build_stage1_universe([s for s in UNIVERSE if s not in current_symbols])
+    if not stage1_symbols:
+        log("Stage 1 scan found no viable symbols.")
+        return pd.DataFrame()
+
+    cands = score_candidates(model, stage1_symbols)
+    log_candidates(cands, threshold)
+
     if cands.empty:
-        log("No viable candidates.")
-        return
+        log("No viable candidates after stage 2/3.")
+        return cands
 
-    buys = cands[cands["prob"] >= threshold].head(open_slots).copy()
+    buys = cands[(cands["prob"] >= threshold) & (cands["accepted"])].head(open_slots).copy()
     if buys.empty:
         log(f"No candidates above threshold {threshold:.3f}")
-        return
+        return cands
 
     equity = get_equity()
     cash = get_cash()
@@ -1008,7 +1236,7 @@ def open_new_positions(model) -> None:
 
     if per_position_budget < MIN_ORDER_NOTIONAL:
         log("Not enough usable cash for new positions.")
-        return
+        return cands
 
     state = load_open_state()
     for _, row in buys.iterrows():
@@ -1026,41 +1254,298 @@ def open_new_positions(model) -> None:
                 "entry_price": price,
                 "qty": qty,
                 "highest_price": price,
-                "entry_score": float(row["prob"])
+                "entry_score": float(row["prob"]),
+                "entry_reason": row["accept_reason"] if row["accept_reason"] else "passed score + vetting",
             }
+            log_entry(row["symbol"], state[row["symbol"]])
 
     save_open_state(state)
+    return cands
+
+
+# -------------------------
+# Dashboard generation
+# -------------------------
+def load_recent_logs(max_lines=120):
+    if not RUN_LOG_FILE.exists():
+        return []
+    with open(RUN_LOG_FILE, "r", encoding="utf-8") as f:
+        lines = [x.rstrip("\n") for x in f.readlines()]
+    return lines[-max_lines:]
+
+
+def save_simple_equity_chart():
+    if not ACCOUNT_SNAPSHOT_FILE.exists():
+        return None
+    df = pd.read_csv(ACCOUNT_SNAPSHOT_FILE)
+    if df.empty or "equity" not in df.columns:
+        return None
+
+    x = pd.to_datetime(df["snapshot_at"], errors="coerce")
+    y = pd.to_numeric(df["equity"], errors="coerce")
+    fig = plt.figure(figsize=(9, 4))
+    ax = fig.add_subplot(111)
+    ax.plot(x, y)
+    ax.set_title("Equity Curve")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Equity")
+    fig.autofmt_xdate()
+    path = CHARTS_DIR / "equity_curve.png"
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path.name
+
+
+def draw_candlestick_panel(ax, bars: pd.DataFrame):
+    if bars.empty:
+        return
+    bars = bars.reset_index(drop=True).copy()
+    width = 0.55
+    for i, row in bars.iterrows():
+        o = safe_float(row["open"])
+        h = safe_float(row["high"])
+        l = safe_float(row["low"])
+        c = safe_float(row["close"])
+        ax.vlines(i, l, h, linewidth=1)
+        lower = min(o, c)
+        height = max(abs(c - o), 1e-6)
+        rect = Rectangle((i - width / 2, lower), width, height, fill=False, linewidth=1)
+        ax.add_patch(rect)
+    if "ema_8" in bars.columns:
+        ax.plot(np.arange(len(bars)), bars["ema_8"].values, linewidth=1, label="EMA8")
+    if "ema_21" in bars.columns:
+        ax.plot(np.arange(len(bars)), bars["ema_21"].values, linewidth=1, label="EMA21")
+    if "session_vwap" in bars.columns:
+        ax.plot(np.arange(len(bars)), bars["session_vwap"].values, linewidth=1, linestyle="--", label="VWAP")
+    ax.legend(loc="upper left", fontsize=7)
+    ax.set_xlim(-1, len(bars))
+
+
+def save_trade_chart(symbol: str, entry_price=None, exit_price=None):
+    bars = get_bars(symbol, DASHBOARD_BARS)
+    if bars.empty or len(bars) < 40:
+        return None
+
+    feats = build_features(bars)
+    if feats.empty:
+        return None
+    feats = feats.tail(DASHBOARD_BARS).copy().reset_index(drop=True)
+
+    threshold = adaptive_buy_threshold()
+    model = load_model()
+    if model is not None:
+        feat_input = feats[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        try:
+            prob_series = model.predict_proba(feat_input)[:, 1]
+        except Exception:
+            prob_series = np.full(len(feats), np.nan)
+    else:
+        prob_series = np.full(len(feats), np.nan)
+
+    fig = plt.figure(figsize=(10, 7))
+    gs = fig.add_gridspec(3, 1, height_ratios=[3, 1.2, 1.2])
+    ax1 = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1], sharex=ax1)
+    ax3 = fig.add_subplot(gs[2], sharex=ax1)
+
+    draw_candlestick_panel(ax1, feats)
+    ax1.set_title(f"{symbol} | Candles + Signals")
+    x = np.arange(len(feats))
+
+    if entry_price is not None:
+        ax1.axhline(entry_price, linestyle="--", linewidth=1)
+    if exit_price is not None:
+        ax1.axhline(exit_price, linestyle=":", linewidth=1)
+
+    for idx, r in feats.tail(20).iterrows():
+        notes = []
+        if int(safe_float(r.get("cdl_bull_engulf"))) == 1:
+            notes.append("Engulf")
+        if int(safe_float(r.get("cdl_hammer"))) == 1:
+            notes.append("Hammer")
+        if int(safe_float(r.get("breakout_20_up"))) == 1:
+            notes.append("Breakout")
+        if notes:
+            ax1.annotate(",".join(notes), (idx, safe_float(r["high"])), fontsize=6)
+
+    ax2.plot(x, prob_series, linewidth=1)
+    ax2.axhline(threshold, linestyle="--", linewidth=1)
+    ax2.axhline(PROB_SELL_FLOOR, linestyle=":", linewidth=1)
+    ax2.set_ylabel("Prob")
+
+    ax3.plot(x, feats["rel_volume_20"].values, linewidth=1, label="RelVol20")
+    ax3.plot(x, (feats["adx_14"] / 25.0).values, linewidth=1, label="ADX/25")
+    ax3.plot(x, (feats["session_vwap_dist"].fillna(0).values * 50.0), linewidth=1, label="VWAPdist*50")
+    ax3.legend(fontsize=7, loc="upper left")
+    ax3.set_ylabel("Signals")
+    ax3.set_xlabel("Bars")
+
+    path = CHARTS_DIR / f"{symbol}_decision.png"
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path.name
+
+
+def html_table(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "<p>No data.</p>"
+    show = df.copy()
+    for c in show.columns:
+        if pd.api.types.is_float_dtype(show[c]):
+            show[c] = show[c].map(lambda v: f"{v:.4f}")
+    return show.to_html(index=False, classes="tbl", border=0)
+
+
+def render_dashboard(last_candidates: pd.DataFrame):
+    positions = get_positions_dict()
+    open_state = load_open_state()
+    trade_hist = load_trade_history().tail(20) if TRADE_HISTORY_FILE.exists() else pd.DataFrame()
+    candidate_log = pd.read_csv(CANDIDATE_LOG_FILE).tail(20) if CANDIDATE_LOG_FILE.exists() else pd.DataFrame()
+    entry_log = pd.read_csv(ENTRY_LOG_FILE).tail(10) if ENTRY_LOG_FILE.exists() else pd.DataFrame()
+    logs = load_recent_logs()
+    model_meta = load_model_meta()
+
+    open_rows = []
+    chart_files = []
+    for sym, pos in positions.items():
+        entry = safe_float(pos.avg_entry_price, 0.0)
+        current = safe_float(pos.current_price, entry)
+        qty = safe_float(pos.qty, 0.0)
+        pnl_pct = (current / entry - 1.0) if entry > 0 else 0.0
+        state = open_state.get(sym, {})
+        open_rows.append({
+            "symbol": sym,
+            "qty": qty,
+            "entry_price": entry,
+            "current_price": current,
+            "pnl_pct": pnl_pct,
+            "entry_score": state.get("entry_score"),
+            "entry_reason": state.get("entry_reason", ""),
+        })
+        cf = save_trade_chart(sym, entry_price=entry)
+        if cf:
+            chart_files.append((sym, cf, state.get("entry_reason", "")))
+
+    if last_candidates is not None and not last_candidates.empty:
+        for sym in last_candidates.head(4)["symbol"].tolist():
+            if sym not in [x[0] for x in chart_files]:
+                cf = save_trade_chart(sym)
+                if cf:
+                    sub = last_candidates[last_candidates["symbol"] == sym].iloc[0]
+                    note = sub.get("accept_reason", "") or sub.get("reject_reason", "")
+                    chart_files.append((sym, cf, note))
+
+    open_df = pd.DataFrame(open_rows)
+    equity_chart = save_simple_equity_chart()
+
+    cards_html = f"""
+    <div class=\"cards\">
+      <div class=\"card\"><div class=\"label\">Last Run</div><div class=\"value\">{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</div></div>
+      <div class=\"card\"><div class=\"label\">Equity</div><div class=\"value\">{get_equity():.2f}</div></div>
+      <div class=\"card\"><div class=\"label\">Cash</div><div class=\"value\">{get_cash():.2f}</div></div>
+      <div class=\"card\"><div class=\"label\">Open Positions</div><div class=\"value\">{len(positions)}</div></div>
+      <div class=\"card\"><div class=\"label\">Universe Size</div><div class=\"value\">{len(UNIVERSE)}</div></div>
+      <div class=\"card\"><div class=\"label\">Model Rows</div><div class=\"value\">{model_meta.get('train_rows', 0)}</div></div>
+    </div>
+    """
+
+    chart_html_parts = []
+    if equity_chart:
+        chart_html_parts.append(
+            f'<div class="panel"><h2>Equity Curve</h2><img class="wide" src="charts/{equity_chart}" alt="equity curve"></div>'
+        )
+
+    for sym, cf, note in chart_files[:8]:
+        chart_html_parts.append(
+            f'<div class="panel"><h2>{sym} Decision Chart</h2><p class="muted">{note}</p><img class="wide" src="charts/{cf}" alt="{sym} decision chart"></div>'
+        )
+
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Phase 9.5 Trading Dashboard</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 16px; background:#f7f7f7; color:#111; }}
+h1,h2 {{ margin: 0 0 10px 0; }}
+.panel {{ background:white; padding:14px; margin:14px 0; border-radius:14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow-x:auto; }}
+.cards {{ display:grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap:10px; }}
+.card {{ background:white; padding:12px; border-radius:14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+.label {{ font-size:12px; color:#666; }}
+.value {{ font-size:20px; margin-top:4px; }}
+.tbl {{ width:100%; border-collapse: collapse; font-size: 13px; }}
+.tbl th, .tbl td {{ padding: 8px; border-bottom:1px solid #ddd; text-align:left; }}
+.wide {{ width:100%; height:auto; border-radius:8px; }}
+.muted {{ color:#666; font-size:13px; }}
+pre {{ white-space: pre-wrap; word-wrap: break-word; font-size:12px; }}
+</style>
+</head>
+<body>
+<h1>Phase 9.5 Trading Dashboard</h1>
+<p class=\"muted\">Mobile-friendly HTML dashboard generated by the bot. Open this file on laptop or Android.</p>
+{cards_html}
+{''.join(chart_html_parts)}
+<div class=\"panel\"><h2>Open Positions</h2>{html_table(open_df)}</div>
+<div class=\"panel\"><h2>Top Recent Candidates</h2>{html_table(last_candidates.head(12) if last_candidates is not None and not last_candidates.empty else pd.DataFrame())}</div>
+<div class=\"panel\"><h2>Recent Candidate Log</h2>{html_table(candidate_log)}</div>
+<div class=\"panel\"><h2>Recent Entries</h2>{html_table(entry_log)}</div>
+<div class=\"panel\"><h2>Recent Closed Trades</h2>{html_table(trade_hist)}</div>
+<div class=\"panel\"><h2>Recent Run Logs</h2><pre>{chr(10).join(logs)}</pre></div>
+</body>
+</html>"""
+
+    with open(DASHBOARD_DIR / "dashboard.html", "w", encoding="utf-8") as f:
+        f.write(html)
 
 
 # -------------------------
 # Main
 # -------------------------
 def run_bot():
-    log("=== Phase 9 bot start ===")
+    log("=== Phase 9.5 bot start ===")
+    log_account_snapshot()
 
     if not market_is_open():
-        log("Market is closed. Exiting cleanly.")
+        log("Market is closed. Rendering dashboard and exiting cleanly.")
+        render_dashboard(pd.DataFrame())
         return
 
     sync_open_state_with_broker()
 
-    # Refresh compact rolling learning set
-    new_rows = update_training_store(UNIVERSE)
+    stage1_for_training = build_stage1_universe(UNIVERSE)
+    training_symbols = stage1_for_training if stage1_for_training else UNIVERSE[:24]
+    new_rows = update_training_store(training_symbols)
     meta = load_model_meta()
     meta["new_rows_since_train"] = int(meta.get("new_rows_since_train", 0)) + int(new_rows)
     save_json(MODEL_META_FILE, meta)
-    log(f"Training store updated with ~{new_rows} rows")
+    log(f"Training store updated with ~{new_rows} rows using {len(training_symbols)} symbols")
 
-    model, meta = train_or_load_model(force=False)
+    model, _ = train_or_load_model(force=False)
 
     manage_positions(model)
-    time.sleep(1)
-    open_new_positions(model)
+    cands = open_new_positions(model)
 
     rolling_trim_csv(TRAIN_DATA_FILE, MAX_TRAIN_ROWS)
     rolling_trim_csv(TRADE_HISTORY_FILE, MAX_TRADE_HISTORY_ROWS)
+    rolling_trim_csv(CANDIDATE_LOG_FILE, MAX_CANDIDATE_LOG_ROWS)
+    rolling_trim_csv(ENTRY_LOG_FILE, 1000)
+    rolling_trim_csv(EXIT_LOG_FILE, 1000)
+    rolling_trim_csv(ACCOUNT_SNAPSHOT_FILE, MAX_ACCOUNT_SNAPSHOT_ROWS)
 
-    log("=== Phase 9 bot end ===")
+    render_dashboard(cands)
+    save_json(
+        LAST_RUN_FILE,
+        {
+            "completed_at": datetime.utcnow().isoformat(),
+            "candidate_count": 0 if cands is None else int(len(cands)),
+            "open_positions": int(len(get_positions_dict())),
+        },
+    )
+
+    log("=== Phase 9.5 bot end ===")
 
 
 if __name__ == "__main__":
