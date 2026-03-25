@@ -1,12 +1,15 @@
-name: Trading Bot Phase 9.5
+name: Trading Phase 95
 
 on:
   schedule:
-    - cron: "*/10 14-21 * * 1-5"
+    # GitHub cron is UTC.
+    # These overlapping schedules cover both DST and standard-time market hours.
+    - cron: "*/5 13-21 * * 1-5"
+    - cron: "*/5 14-22 * * 1-5"
   workflow_dispatch:
 
 jobs:
-  run-bot:
+  run-bot-phase95:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,25 +23,21 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install alpaca-trade-api pandas numpy scikit-learn matplotlib
+          python -m pip install --upgrade pip
+          pip install alpaca-trade-api pandas numpy pytz
 
-      - name: Run bot
+      - name: Run bot_phase95.py
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
         run: python bot_phase95.py
 
-      - name: Upload bot artifacts
+      - name: Upload phase95 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trading-bot-phase95
+          name: phase95-artifacts
           path: |
-            data/**
-            logs/**
-            models/**
-            state/**
-            dashboard/**
-          if-no-files-found: ignore
+            logs/
+            data/
