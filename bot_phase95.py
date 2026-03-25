@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -14,12 +13,13 @@ import alpaca_trade_api as tradeapi
 
 # ============================================================
 # bot_phase95.py
-# Phase 9.5 - opening range breakout with:
-# - image-style stop/entry/target signaling
-# - SPY market regime filter
-# - actual fill price reconciliation
-# - adaptive pattern profitability scoring
-# - daily kill switch
+# Phase 9.5
+# - Opening-range signal based on first 5-minute candle
+# - Softer SPY filter
+# - Actual fill reconciliation
+# - Lightweight profitability learning from logged pattern tags
+# - Entries allowed through 11:00 ET
+# - Forced flat at 11:00 ET
 # ============================================================
 
 
@@ -70,34 +70,44 @@ MAX_DAILY_NET_LOSS_PCT = 0.02
 MAX_DAILY_LOSING_TRADES = 3
 
 MIN_PRICE = 5.0
-MAX_PRICE = 150.0
-MIN_DOLLAR_VOLUME = 2_500_000
-MIN_RELATIVE_VOLUME = 1.3
+MAX_PRICE = 200.0
 
-MIN_5M_RANGE_PCT = 0.0035
-MAX_5M_RANGE_PCT = 0.05
-MAX_RISK_PER_SHARE_PCT = 0.03
+MIN_DOLLAR_VOLUME = 1_500_000
+MIN_RELATIVE_VOLUME = 1.05
 
-ENTRY_BUFFER_PCT = 0.0005
+MIN_5M_RANGE_PCT = 0.0020
+MAX_5M_RANGE_PCT = 0.08
+MAX_RISK_PER_SHARE_PCT = 0.04
+
+ENTRY_BUFFER_PCT = 0.0003
 MIN_ENTRY_BUFFER_DOLLARS = 0.01
+NEAR_BREAKOUT_PCT = 0.0015
+
 TARGET_R_MULTIPLE = 2.0
 
-FORCE_EXIT_HOUR = 10
-FORCE_EXIT_MINUTE = 15
+ENTRY_START_HOUR = 9
+ENTRY_START_MINUTE = 35
+ENTRY_END_HOUR = 11
+ENTRY_END_MINUTE = 0
+
+FORCE_EXIT_HOUR = 11
+FORCE_EXIT_MINUTE = 0
 
 SPY_SYMBOL = "SPY"
 SCANNER_LIMIT = 200
 
 SEC_FEE_RATE = 0.0000206
 
-MIN_BODY_FRACTION = 0.40          # candle body must be at least 40% of range
-MAX_OPPOSITE_WICK_FRACTION = 0.35 # opposite wick too large => weaker signal
-MIN_CLOSE_NEAR_EXTREME = 0.65     # close near breakout side
+# Lenient signal settings
+MIN_BODY_FRACTION = 0.25
+MAX_OPPOSITE_WICK_FRACTION = 0.55
+MIN_CLOSE_NEAR_EXTREME_LONG = 0.55
+MAX_CLOSE_NEAR_EXTREME_SHORT = 0.45
 
-MIN_ADAPTIVE_SCORE = -0.20        # if pattern learning says too weak, reject
+# Learning filter kept mild so it does not block too many trades
+MIN_ADAPTIVE_SCORE = -0.50
 
 
-# Liquid tradable universe
 DEFAULT_UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "TSLA", "GOOGL", "NFLX", "INTC",
     "MU", "PLTR", "CRM", "ADBE", "AVGO", "QCOM", "SHOP", "UBER", "COIN", "SMCI",
@@ -121,7 +131,7 @@ def now_et() -> datetime:
 
 
 def log(msg: str) -> None:
-    stamp = now_et().strftime("%Y-%m-%d %H:%M:%S %Z")
+    stamp = now_et().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {msg}")
 
 
@@ -184,17 +194,16 @@ def reset_daily_state_if_needed(state: Dict) -> Dict:
     today = now_et().strftime("%Y-%m-%d")
     if state.get("date") != today:
         equity = get_account_equity()
-        new_state = default_state()
-        new_state["date"] = today
-        new_state["daily_start_equity"] = equity
-        save_state(new_state)
+        state = default_state()
+        state["date"] = today
+        state["daily_start_equity"] = equity
+        save_state(state)
         log(f"Daily state reset. Start equity={equity:.2f}")
-        return new_state
     return state
 
 
 # -----------------------------
-# Logs
+# Log columns
 # -----------------------------
 TRADE_COLUMNS = [
     "timestamp_et", "symbol", "direction", "event", "qty",
@@ -251,22 +260,37 @@ def get_current_positions() -> Dict[str, Dict]:
 
 
 def is_entry_window(current_et: datetime) -> bool:
-    start = current_et.replace(hour=9, minute=35, second=0, microsecond=0)
-    end = current_et.replace(hour=FORCE_EXIT_HOUR, minute=FORCE_EXIT_MINUTE, second=0, microsecond=0)
+    start = current_et.replace(
+        hour=ENTRY_START_HOUR,
+        minute=ENTRY_START_MINUTE,
+        second=0,
+        microsecond=0
+    )
+    end = current_et.replace(
+        hour=ENTRY_END_HOUR,
+        minute=ENTRY_END_MINUTE,
+        second=0,
+        microsecond=0
+    )
     return start <= current_et < end
 
 
 def is_force_exit_time(current_et: datetime) -> bool:
-    cutoff = current_et.replace(hour=FORCE_EXIT_HOUR, minute=FORCE_EXIT_MINUTE, second=0, microsecond=0)
+    cutoff = current_et.replace(
+        hour=FORCE_EXIT_HOUR,
+        minute=FORCE_EXIT_MINUTE,
+        second=0,
+        microsecond=0
+    )
     return current_et >= cutoff
 
 
 # -----------------------------
 # Data retrieval
 # -----------------------------
-def get_minute_bars(symbol: str, minutes_back: int = 90) -> pd.DataFrame:
+def get_minute_bars(symbol: str, minutes_back: int = 120) -> pd.DataFrame:
     end_utc = datetime.now(UTC)
-    start_utc = end_utc - timedelta(minutes=minutes_back + 20)
+    start_utc = end_utc - timedelta(minutes=minutes_back + 30)
 
     bars = api.get_bars(
         symbol,
@@ -319,7 +343,7 @@ def get_latest_trade_price(symbol: str) -> Optional[float]:
 
 
 # -----------------------------
-# Opening candle / image-style signal
+# Session filtering
 # -----------------------------
 def filter_today_regular_session(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -333,6 +357,9 @@ def filter_today_regular_session(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# -----------------------------
+# Opening signal
+# -----------------------------
 def build_opening_5m_candle(minute_bars: pd.DataFrame) -> Optional[Dict]:
     df = filter_today_regular_session(minute_bars)
     if df.empty:
@@ -355,14 +382,11 @@ def build_opening_5m_candle(minute_bars: pd.DataFrame) -> Optional[Dict]:
     candle_range = max(high_ - low_, 0.0001)
     body = abs(close_ - open_)
     body_fraction = body / candle_range
-
     upper_wick = high_ - max(open_, close_)
     lower_wick = min(open_, close_) - low_
+    close_position = (close_ - low_) / candle_range
 
-    close_position = (close_ - low_) / candle_range  # 0 near low, 1 near high
-
-    direction = "long" if close_ > open_ else "short"
-
+    direction = "long" if close_ >= open_ else "short"
     opposite_wick_fraction = (
         lower_wick / candle_range if direction == "long" else upper_wick / candle_range
     )
@@ -393,20 +417,16 @@ def opening_candle_is_valid(opening: Dict) -> bool:
         return False
 
     if opening["direction"] == "long":
-        if opening["close_position"] < MIN_CLOSE_NEAR_EXTREME:
+        if opening["close_position"] < MIN_CLOSE_NEAR_EXTREME_LONG:
             return False
     else:
-        if opening["close_position"] > (1.0 - MIN_CLOSE_NEAR_EXTREME):
+        if opening["close_position"] > MAX_CLOSE_NEAR_EXTREME_SHORT:
             return False
 
     return True
 
 
-def build_image_style_trade_levels(opening: Dict, latest_price: float) -> Dict:
-    """
-    Signal structure based on the user's image logic:
-    stop -> entry -> target defined by the opening 5m signal bar
-    """
+def build_trade_levels(opening: Dict, latest_price: float) -> Dict:
     buffer_amt = max(latest_price * ENTRY_BUFFER_PCT, MIN_ENTRY_BUFFER_DOLLARS)
 
     if opening["direction"] == "long":
@@ -430,29 +450,16 @@ def build_image_style_trade_levels(opening: Dict, latest_price: float) -> Dict:
     }
 
 
-def breakout_is_confirmed(symbol: str, opening: Dict, minute_bars: pd.DataFrame) -> bool:
-    """
-    Require that price is on the breakout side after 9:35 and not merely touching.
-    """
-    df = filter_today_regular_session(minute_bars)
-    if df.empty:
-        return False
-
-    post_opening = df[df.index.time >= datetime.strptime("09:35", "%H:%M").time()]
-    if post_opening.empty:
-        return False
-
-    latest_close = float(post_opening.iloc[-1]["close"])
-    latest_high = float(post_opening.iloc[-1]["high"])
-    latest_low = float(post_opening.iloc[-1]["low"])
-
+def breakout_is_confirmed(opening: Dict, latest_price: float, levels: Dict) -> bool:
     if opening["direction"] == "long":
-        return latest_close >= opening["high"] or latest_high > opening["high"]
-    return latest_close <= opening["low"] or latest_low < opening["low"]
+        trigger = levels["entry_price"]
+        return latest_price >= trigger or latest_price >= trigger * (1 - NEAR_BREAKOUT_PCT)
+    trigger = levels["entry_price"]
+    return latest_price <= trigger or latest_price <= trigger * (1 + NEAR_BREAKOUT_PCT)
 
 
 # -----------------------------
-# SPY filter
+# SPY regime
 # -----------------------------
 def compute_intraday_vwap(df: pd.DataFrame) -> pd.Series:
     typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -462,24 +469,18 @@ def compute_intraday_vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def get_spy_regime() -> Dict:
-    """
-    Regime logic:
-    - bullish if SPY above VWAP and above opening midpoint
-    - bearish if SPY below VWAP and below opening midpoint
-    - neutral otherwise
-    """
     try:
-        spy_bars = get_minute_bars(SPY_SYMBOL, 90)
+        spy_bars = get_minute_bars(SPY_SYMBOL, 120)
         spy_bars = filter_today_regular_session(spy_bars)
         if spy_bars.empty or len(spy_bars) < 10:
-            return {"regime": "neutral", "vwap": None, "last": None}
+            return {"regime": "neutral", "last": None, "vwap": None}
 
         spy_bars = spy_bars.copy()
         spy_bars["vwap"] = compute_intraday_vwap(spy_bars)
 
         opening = build_opening_5m_candle(spy_bars)
         if not opening:
-            return {"regime": "neutral", "vwap": None, "last": None}
+            return {"regime": "neutral", "last": None, "vwap": None}
 
         last_close = float(spy_bars.iloc[-1]["close"])
         last_vwap = float(spy_bars.iloc[-1]["vwap"])
@@ -492,33 +493,33 @@ def get_spy_regime() -> Dict:
         else:
             regime = "neutral"
 
-        return {"regime": regime, "vwap": round(last_vwap, 4), "last": round(last_close, 4)}
+        return {"regime": regime, "last": round(last_close, 4), "vwap": round(last_vwap, 4)}
     except Exception as e:
         log(f"SPY regime error: {e}")
-        return {"regime": "neutral", "vwap": None, "last": None}
+        return {"regime": "neutral", "last": None, "vwap": None}
 
 
-def spy_allows_direction(spy_regime: str, direction: str) -> bool:
+def spy_score_adjustment(spy_regime: str, direction: str) -> float:
     if spy_regime == "neutral":
-        return False
-    if direction == "long" and spy_regime == "bullish":
-        return True
-    if direction == "short" and spy_regime == "bearish":
-        return True
-    return False
+        return 0.0
+    if direction == "long":
+        return 0.75 if spy_regime == "bullish" else -0.75
+    return 0.75 if spy_regime == "bearish" else -0.75
 
 
 # -----------------------------
-# Relative volume / scanner
+# Relative volume
 # -----------------------------
 def compute_relative_volume(symbol: str, opening_volume: float) -> float:
     daily = get_daily_bars(symbol, 15)
     if daily.empty or len(daily) < 6:
         return 0.0
-    avg_daily_vol = float(daily["volume"].tail(10).mean())
-    avg_opening_5m_proxy = avg_daily_vol / 78.0 if avg_daily_vol > 0 else 0.0
+
+    avg_daily_volume = float(daily["volume"].tail(10).mean())
+    avg_opening_5m_proxy = avg_daily_volume / 78.0 if avg_daily_volume > 0 else 0.0
     if avg_opening_5m_proxy <= 0:
         return 0.0
+
     return opening_volume / avg_opening_5m_proxy
 
 
@@ -543,14 +544,16 @@ def build_pattern_stats() -> Dict[str, Dict]:
     if exits.empty or "pattern_tags" not in exits.columns:
         return {}
 
-    stats = {}
+    stats: Dict[str, Dict] = {}
+
     for _, row in exits.iterrows():
         tags_str = str(row.get("pattern_tags", "")).strip()
         if not tags_str or tags_str == "nan":
             continue
-        tags = [t for t in tags_str.split("|") if t]
+
         net_pnl = safe_float(row.get("net_pnl"), 0.0)
         win = 1 if net_pnl > 0 else 0
+        tags = [t for t in tags_str.split("|") if t]
 
         for tag in tags:
             if tag not in stats:
@@ -563,6 +566,7 @@ def build_pattern_stats() -> Dict[str, Dict]:
 
 
 def save_pattern_stats(stats: Dict[str, Dict]) -> None:
+    ensure_dirs()
     with open(PATTERN_STATS_FILE, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
@@ -579,32 +583,32 @@ def load_pattern_stats() -> Dict[str, Dict]:
     return stats
 
 
+def refresh_pattern_stats() -> Dict[str, Dict]:
+    stats = build_pattern_stats()
+    save_pattern_stats(stats)
+    return stats
+
+
 def adaptive_pattern_score(tags: List[str], stats: Dict[str, Dict]) -> float:
-    """
-    Lightweight learning layer:
-    - Bayesian win-rate smoothing
-    - very small pnl contribution
-    """
     if not tags:
         return 0.0
 
     scores = []
     for tag in tags:
-        s = stats.get(tag)
-        if not s:
+        item = stats.get(tag)
+        if not item:
             continue
 
-        count = int(s.get("count", 0))
-        wins = int(s.get("wins", 0))
-        net_pnl_sum = safe_float(s.get("net_pnl_sum", 0.0))
+        count = int(item.get("count", 0))
+        wins = int(item.get("wins", 0))
+        net_pnl_sum = safe_float(item.get("net_pnl_sum", 0.0))
 
-        smoothed_win_rate = (wins + 2.0) / (count + 4.0)  # pulls toward 50%
+        smoothed_win_rate = (wins + 2.0) / (count + 4.0)
         pnl_per_trade = net_pnl_sum / max(count, 1)
 
-        tag_score = (smoothed_win_rate - 0.5) * 2.0
-        tag_score += clamp(pnl_per_trade / 50.0, -0.25, 0.25)
+        tag_score = (smoothed_win_rate - 0.5) * 1.5
+        tag_score += clamp(pnl_per_trade / 50.0, -0.20, 0.20)
 
-        # low sample penalty
         if count < 5:
             tag_score *= 0.5
 
@@ -612,7 +616,6 @@ def adaptive_pattern_score(tags: List[str], stats: Dict[str, Dict]) -> float:
 
     if not scores:
         return 0.0
-
     return float(np.mean(scores))
 
 
@@ -622,22 +625,21 @@ def candidate_pattern_tags(
     spy_regime: str,
     risk_per_share_pct: float
 ) -> List[str]:
-    tags = []
-
-    tags.append(f"dir_{opening['direction']}")
-    tags.append("spy_aligned" if spy_allows_direction(spy_regime, opening["direction"]) else "spy_not_aligned")
+    tags = [f"dir_{opening['direction']}", f"spy_{spy_regime}"]
 
     if rel_vol >= 2.0:
         tags.append("rvol_high")
-    elif rel_vol >= 1.5:
+    elif rel_vol >= 1.3:
         tags.append("rvol_good")
     else:
-        tags.append("rvol_low")
+        tags.append("rvol_ok")
 
     if opening["body_fraction"] >= 0.60:
         tags.append("body_strong")
+    elif opening["body_fraction"] >= 0.40:
+        tags.append("body_ok")
     else:
-        tags.append("body_medium")
+        tags.append("body_light")
 
     if opening["direction"] == "long":
         if opening["close_position"] >= 0.85:
@@ -666,21 +668,21 @@ def candidate_pattern_tags(
 # -----------------------------
 def base_candidate_score(opening: Dict, rel_vol: float, latest_price: float) -> float:
     score = 0.0
-    score += rel_vol * 4.0
-    score += opening["range_pct"] * 100.0
-    score += opening["body_fraction"] * 2.0
+    score += rel_vol * 3.5
+    score += opening["range_pct"] * 90.0
+    score += opening["body_fraction"] * 1.5
 
     if opening["direction"] == "long":
-        score += opening["close_position"] * 1.5
+        score += opening["close_position"] * 1.0
     else:
-        score += (1.0 - opening["close_position"]) * 1.5
+        score += (1.0 - opening["close_position"]) * 1.0
 
-    score += latest_price / 1000.0
+    score += latest_price / 1200.0
     return score
 
 
 # -----------------------------
-# Risk and sizing
+# Risk / sizing
 # -----------------------------
 def calculate_qty(entry_price: float, stop_price: float, equity: float, buying_power: float) -> int:
     risk_per_share = abs(entry_price - stop_price)
@@ -694,9 +696,9 @@ def calculate_qty(entry_price: float, stop_price: float, equity: float, buying_p
 
 
 # -----------------------------
-# Order handling / fill reconciliation
+# Orders / fill reconciliation
 # -----------------------------
-def wait_for_fill_price(order_id: str, retries: int = 8, sleep_seconds: int = 2) -> Tuple[Optional[float], Optional[str]]:
+def wait_for_fill_price(order_id: str, retries: int = 6, sleep_seconds: int = 2) -> Tuple[Optional[float], Optional[str]]:
     for _ in range(retries):
         try:
             order = api.get_order(order_id)
@@ -708,7 +710,6 @@ def wait_for_fill_price(order_id: str, retries: int = 8, sleep_seconds: int = 2)
 
             if status in {"canceled", "expired", "rejected"}:
                 return None, status
-
         except Exception:
             pass
 
@@ -766,7 +767,7 @@ def submit_exit_order(symbol: str, qty: int, position_side: str) -> Optional[Dic
 
 
 # -----------------------------
-# Fees / pnl
+# PnL / fees
 # -----------------------------
 def estimate_sec_fee(exit_side: str, exit_price: float, qty: int) -> float:
     if exit_side.lower() != "sell":
@@ -815,12 +816,10 @@ def update_kill_switch(state: Dict) -> Dict:
 def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
     spy = get_spy_regime()
     spy_regime = spy["regime"]
-    if spy_regime == "neutral":
-        log("SPY regime neutral. No new trades.")
-        return []
 
     equity = get_account_equity()
     buying_power = get_buying_power()
+
     candidates = []
 
     for symbol in DEFAULT_UNIVERSE[:SCANNER_LIMIT]:
@@ -828,7 +827,7 @@ def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
             continue
 
         try:
-            minute_bars = get_minute_bars(symbol, 90)
+            minute_bars = get_minute_bars(symbol, 120)
             if minute_bars.empty:
                 continue
 
@@ -846,9 +845,6 @@ def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
             if latest_price < MIN_PRICE or latest_price > MAX_PRICE:
                 continue
 
-            if not spy_allows_direction(spy_regime, opening["direction"]):
-                continue
-
             rel_vol = compute_relative_volume(symbol, opening["volume"])
             if rel_vol < MIN_RELATIVE_VOLUME:
                 continue
@@ -857,11 +853,11 @@ def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
             if dollar_volume < MIN_DOLLAR_VOLUME:
                 continue
 
-            levels = build_image_style_trade_levels(opening, latest_price)
+            levels = build_trade_levels(opening, latest_price)
             if levels["risk_per_share_pct"] > MAX_RISK_PER_SHARE_PCT:
                 continue
 
-            if not breakout_is_confirmed(symbol, opening, minute_bars):
+            if not breakout_is_confirmed(opening, latest_price, levels):
                 continue
 
             qty = calculate_qty(levels["entry_price"], levels["stop_price"], equity, buying_power)
@@ -874,12 +870,13 @@ def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
                 spy_regime=spy_regime,
                 risk_per_share_pct=levels["risk_per_share_pct"]
             )
+
             adaptive_score = adaptive_pattern_score(pattern_tags, pattern_stats)
             if adaptive_score < MIN_ADAPTIVE_SCORE:
                 continue
 
             base_score = base_candidate_score(opening, rel_vol, latest_price)
-            score = base_score + adaptive_score
+            total_score = base_score + adaptive_score + spy_score_adjustment(spy_regime, opening["direction"])
 
             candidates.append({
                 "symbol": symbol,
@@ -898,9 +895,8 @@ def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
                 "pattern_tags": pattern_tags,
                 "adaptive_score": adaptive_score,
                 "base_score": base_score,
-                "score": score
+                "score": total_score
             })
-
         except Exception as e:
             log(f"Scanner skip {symbol}: {e}")
 
@@ -982,7 +978,9 @@ def maybe_enter_new_positions(state: Dict, pattern_stats: Dict[str, Dict]) -> Di
         if not order_result:
             continue
 
-        entry_fill = order_result["fill_price"] if order_result["fill_price"] is not None else c["entry_price"]
+        entry_fill = order_result["fill_price"]
+        if entry_fill is None:
+            entry_fill = c["latest_price"]
 
         state["trades_today"] += 1
         state["symbols_traded_today"].append(symbol)
@@ -1018,7 +1016,7 @@ def maybe_enter_new_positions(state: Dict, pattern_stats: Dict[str, Dict]) -> Di
             "exit_order_id": "",
             "exit_price_est": "",
             "exit_price_fill": "",
-            "reason": "image_signal_opening_range_breakout",
+            "reason": "opening_range_signal",
             "gross_pnl": "",
             "sec_fee": "",
             "net_pnl": "",
@@ -1054,6 +1052,8 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
         qty = int(live_pos["qty"])
         current_price = safe_float(live_pos["current_price"], None)
         if current_price is None:
+            current_price = get_latest_trade_price(symbol)
+        if current_price is None:
             continue
 
         stop_price = safe_float(tracked["stop_price"])
@@ -1074,7 +1074,7 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
                 reason = "target_hit"
 
         if is_force_exit_time(current):
-            reason = "time_exit_1015"
+            reason = "time_exit_1100"
 
         if not reason:
             continue
@@ -1086,7 +1086,10 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
             save_state(state)
             continue
 
-        exit_fill = exit_result["fill_price"] if exit_result["fill_price"] is not None else current_price
+        exit_fill = exit_result["fill_price"]
+        if exit_fill is None:
+            exit_fill = current_price
+
         pnl = compute_trade_pnl(direction, entry_fill, exit_fill, qty)
 
         append_csv(TRADES_LOG_FILE, {
@@ -1138,16 +1141,7 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
 
 
 # -----------------------------
-# Pattern stats refresh
-# -----------------------------
-def refresh_pattern_stats() -> Dict[str, Dict]:
-    stats = build_pattern_stats()
-    save_pattern_stats(stats)
-    return stats
-
-
-# -----------------------------
-# Main runner
+# Main
 # -----------------------------
 def run_bot() -> None:
     log("=== bot_phase95.py start ===")
@@ -1165,13 +1159,10 @@ def run_bot() -> None:
         current = now_et()
         log(f"Current ET time: {current.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-        # First manage open positions.
         state = maybe_manage_and_exit_positions(state)
 
-        # Refresh learning stats after exits.
         pattern_stats = refresh_pattern_stats()
 
-        # Then evaluate new entries.
         if is_entry_window(current):
             state = maybe_enter_new_positions(state, pattern_stats)
         else:
@@ -1184,7 +1175,7 @@ def run_bot() -> None:
             f"realized_net_pnl_today={state.get('realized_net_pnl_today', 0.0)} "
             f"kill_switch={state.get('kill_switch', False)}"
         )
-        log("=== bot_phase95.py complete ===")
+        log("=== bot_phase95.py end ===")
 
     except Exception as e:
         log(f"Fatal error: {e}")
@@ -1192,9 +1183,6 @@ def run_bot() -> None:
         save_state(state)
         raise
 
-
-if __name__ == "__main__":
-    run_bot()
 
 if __name__ == "__main__":
     run_bot()
