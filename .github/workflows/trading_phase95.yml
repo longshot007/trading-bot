@@ -2,8 +2,6 @@ name: Trading Phase 95
 
 on:
   schedule:
-    # GitHub cron is UTC.
-    # These overlapping schedules cover both DST and standard-time market hours.
     - cron: "*/5 13-21 * * 1-5"
     - cron: "*/5 14-22 * * 1-5"
   workflow_dispatch:
