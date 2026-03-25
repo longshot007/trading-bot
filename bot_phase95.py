@@ -1,1552 +1,1200 @@
 import os
 import json
 import math
-import pickle
-from datetime import datetime, timezone
-from pathlib import Path
+import time
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import pytz
 import alpaca_trade_api as tradeapi
-from sklearn.ensemble import RandomForestClassifier
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 
 
 # ============================================================
-# PHASE 9.5 - ADAPTIVE INTRADAY BOT + VISUAL DASHBOARD
-# Broad scanner + multi-stage filtering + foundational signal engine
-# + vetting + minute-level exits + full logging + HTML dashboard
+# bot_phase95.py
+# Phase 9.5 - opening range breakout with:
+# - image-style stop/entry/target signaling
+# - SPY market regime filter
+# - actual fill price reconciliation
+# - adaptive pattern profitability scoring
+# - daily kill switch
 # ============================================================
 
-# -------------------------
+
+# -----------------------------
 # Environment / API
-# -------------------------
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+# -----------------------------
+APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
-if not API_KEY or not API_SECRET:
+if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
     raise RuntimeError("Missing Alpaca credentials in environment variables.")
 
-api = tradeapi.REST(API_KEY, API_SECRET, API_BASE_URL, api_version="v2")
+api = tradeapi.REST(
+    APCA_API_KEY_ID,
+    APCA_API_SECRET_KEY,
+    APCA_API_BASE_URL,
+    api_version="v2"
+)
 
 
-# -------------------------
-# Core config
-# -------------------------
-TIMEFRAME = tradeapi.TimeFrame.Minute
-LOOKBACK_BARS = 260
-DASHBOARD_BARS = 120
-LABEL_HORIZON = 6
-LABEL_THRESHOLD = 0.0022
-MIN_TRAIN_ROWS = 400
-MAX_TRAIN_ROWS = 5000
-MAX_TRADE_HISTORY_ROWS = 800
-MAX_CANDIDATE_LOG_ROWS = 3000
-MAX_ACCOUNT_SNAPSHOT_ROWS = 1000
-MAX_POSITIONS = 4
-MAX_CANDIDATES = 12
-MAX_STAGE1_SYMBOLS = 28
-MAX_ALLOC_PER_POSITION = 0.18
-CASH_RESERVE = 0.10
-MIN_PRICE = 7.0
-MAX_PRICE = 350.0
-MIN_DOLLAR_VOLUME = 5_000_000
-MIN_PROB_TO_BUY = 0.58
-PROB_SELL_FLOOR = 0.46
+# -----------------------------
+# Time zones
+# -----------------------------
+EASTERN = pytz.timezone("US/Eastern")
+UTC = pytz.UTC
 
-STOP_LOSS_PCT = 0.012
-TAKE_PROFIT_PCT = 0.018
-TRAIL_ACTIVATE_PCT = 0.010
-TRAIL_GIVEBACK_PCT = 0.006
-MAX_HOLD_MINUTES = 45
-MIN_ORDER_NOTIONAL = 25.0
-RETRAIN_EVERY_N_NEW_ROWS = 250
-RANDOM_STATE = 42
+
+# -----------------------------
+# Files
+# -----------------------------
+DATA_DIR = "data"
+LOG_DIR = "logs"
+
+STATE_FILE = os.path.join(DATA_DIR, "phase95_state.json")
+TRADES_LOG_FILE = os.path.join(LOG_DIR, "phase95_trades_log.csv")
+SIGNALS_LOG_FILE = os.path.join(LOG_DIR, "phase95_signals_log.csv")
+PATTERN_STATS_FILE = os.path.join(DATA_DIR, "phase95_pattern_stats.json")
+
+
+# -----------------------------
+# Strategy parameters
+# -----------------------------
+MAX_TRADES_PER_DAY = 10
+MAX_OPEN_POSITIONS = 5
+RISK_PER_TRADE_PCT = 0.01
+MAX_DAILY_NET_LOSS_PCT = 0.02
+MAX_DAILY_LOSING_TRADES = 3
+
+MIN_PRICE = 5.0
+MAX_PRICE = 150.0
+MIN_DOLLAR_VOLUME = 2_500_000
+MIN_RELATIVE_VOLUME = 1.3
+
+MIN_5M_RANGE_PCT = 0.0035
+MAX_5M_RANGE_PCT = 0.05
+MAX_RISK_PER_SHARE_PCT = 0.03
+
+ENTRY_BUFFER_PCT = 0.0005
+MIN_ENTRY_BUFFER_DOLLARS = 0.01
+TARGET_R_MULTIPLE = 2.0
+
+FORCE_EXIT_HOUR = 10
+FORCE_EXIT_MINUTE = 15
+
+SPY_SYMBOL = "SPY"
+SCANNER_LIMIT = 200
 
 SEC_FEE_RATE = 0.0000206
-TRADING_FEE_BUFFER = 0.0005
 
-# Step 1: broader but still GitHub-safe liquid universe
-UNIVERSE = sorted(list({
-    "AAPL","MSFT","NVDA","AMD","AMZN","META","TSLA","GOOGL","NFLX","AVGO",
-    "PLTR","SMCI","MU","UBER","CRM","ORCL","INTC","QCOM","SHOP","SQ","PANW",
-    "CRWD","SNOW","COIN","ARM","ADBE","PYPL","TTD","MRVL","NOW","ABNB","ANET",
-    "APP","ASML","AXON","BA","BABA","BKNG","CCL","CELH","CFLT","COST","DASH",
-    "DELL","DKNG","DOCU","DUOL","ETSY","GE","GS","HIMS","HOOD","INTU","ISRG",
-    "KLAC","LRCX","LULU","MDB","MELI","MSTR","NET","NKE","OKTA","ON","PATH",
-    "PDD","RBLX","RDDT","RIOT","ROKU","ROST","SBUX","SERV","SOFI","SPOT","TEAM",
-    "TEM","TMUS","TSM","UPST","V","WMT","ZS","ZM","AI","IOT","DDOG","FSLR",
-    "GTLB","NVO","RIVN","ALAB","HUBS","CHWY","WDAY","MNDY","CPNG","DOCN"
-}))
+MIN_BODY_FRACTION = 0.40          # candle body must be at least 40% of range
+MAX_OPPOSITE_WICK_FRACTION = 0.35 # opposite wick too large => weaker signal
+MIN_CLOSE_NEAR_EXTREME = 0.65     # close near breakout side
+
+MIN_ADAPTIVE_SCORE = -0.20        # if pattern learning says too weak, reject
 
 
-# -------------------------
-# Storage
-# -------------------------
-ROOT = Path(".")
-DATA_DIR = ROOT / "data"
-MODELS_DIR = ROOT / "models"
-LOGS_DIR = ROOT / "logs"
-STATE_DIR = ROOT / "state"
-DASHBOARD_DIR = ROOT / "dashboard"
-CHARTS_DIR = DASHBOARD_DIR / "charts"
-
-for p in [DATA_DIR, MODELS_DIR, LOGS_DIR, STATE_DIR, DASHBOARD_DIR, CHARTS_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
-
-TRAIN_DATA_FILE = DATA_DIR / "train_data.csv"
-TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
-CANDIDATE_LOG_FILE = DATA_DIR / "candidate_log.csv"
-ENTRY_LOG_FILE = DATA_DIR / "entry_log.csv"
-EXIT_LOG_FILE = DATA_DIR / "exit_log.csv"
-ACCOUNT_SNAPSHOT_FILE = DATA_DIR / "account_snapshot.csv"
-
-MODEL_FILE = MODELS_DIR / "phase95_model.pkl"
-MODEL_META_FILE = MODELS_DIR / "phase95_model_meta.json"
-OPEN_STATE_FILE = STATE_DIR / "open_positions.json"
-LAST_RUN_FILE = STATE_DIR / "last_run_summary.json"
-RUN_LOG_FILE = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d')}.log"
+# Liquid tradable universe
+DEFAULT_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "TSLA", "GOOGL", "NFLX", "INTC",
+    "MU", "PLTR", "CRM", "ADBE", "AVGO", "QCOM", "SHOP", "UBER", "COIN", "SMCI",
+    "ARM", "SOFI", "PYPL", "SNOW", "PANW", "CRWD", "ANET", "MRVL", "F", "GM",
+    "BAC", "JPM", "C", "WFC", "XOM", "CVX", "OXY", "SLB", "LLY", "UNH",
+    "JNJ", "PFE", "NKE", "DIS", "BA", "CAT", "DE", "RIOT", "MARA", "HOOD",
+    "RIVN", "LCID", "QQQ", "IWM", "DIA", "ARKK", "TQQQ", "SQQQ", "XLF", "XLK"
+]
 
 
-# -------------------------
+# -----------------------------
 # Utilities
-# -------------------------
+# -----------------------------
+def ensure_dirs() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def now_et() -> datetime:
+    return datetime.now(UTC).astimezone(EASTERN)
+
+
 def log(msg: str) -> None:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{stamp}] {msg}"
-    print(line, flush=True)
-    with open(RUN_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    stamp = now_et().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{stamp}] {msg}")
 
 
-def safe_float(x, default=0.0):
+def safe_float(x, default=0.0) -> float:
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
+        if x is None or x == "":
             return default
         return float(x)
     except Exception:
         return default
 
 
-def load_json(path: Path, default):
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return default
+def clamp(x: float, low: float, high: float) -> float:
+    return max(low, min(high, x))
 
 
-def save_json(path: Path, obj) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
-
-
-def rolling_trim_csv(path: Path, max_rows: int) -> None:
-    if not path.exists():
-        return
-    df = pd.read_csv(path)
-    if len(df) > max_rows:
-        df = df.tail(max_rows).copy()
+def append_csv(path: str, row: Dict, columns: List[str]) -> None:
+    ensure_dirs()
+    exists = os.path.exists(path)
+    df = pd.DataFrame([row]).reindex(columns=columns)
+    if exists:
+        df.to_csv(path, mode="a", header=False, index=False)
+    else:
         df.to_csv(path, index=False)
 
 
-def append_df(path: Path, new_df: pd.DataFrame, dedupe_cols=None, max_rows=None) -> int:
-    if new_df is None or new_df.empty:
-        return 0
-    if path.exists():
-        old = pd.read_csv(path)
-        df = pd.concat([old, new_df], ignore_index=True)
-    else:
-        df = new_df.copy()
-
-    if dedupe_cols:
-        df = df.drop_duplicates(subset=dedupe_cols, keep="last")
-
-    if max_rows is not None and len(df) > max_rows:
-        df = df.tail(max_rows).copy()
-
-    df.to_csv(path, index=False)
-    return len(new_df)
-
-
-def market_is_open() -> bool:
-    try:
-        return bool(api.get_clock().is_open)
-    except Exception as e:
-        log(f"Clock check failed: {e}")
-        return False
-
-
-def get_account():
-    return api.get_account()
-
-
-def get_cash() -> float:
-    return safe_float(get_account().cash, 0.0)
-
-
-def get_equity() -> float:
-    return safe_float(get_account().equity, 0.0)
-
-
-def get_positions_dict():
-    out = {}
-    try:
-        for p in api.list_positions():
-            out[p.symbol] = p
-    except Exception as e:
-        log(f"Could not load positions: {e}")
-    return out
-
-
-def cancel_open_orders(symbol: str = None) -> None:
-    try:
-        orders = api.list_orders(status="open")
-        for o in orders:
-            if symbol is None or o.symbol == symbol:
-                try:
-                    api.cancel_order(o.id)
-                except Exception:
-                    pass
-    except Exception as e:
-        log(f"Cancel open orders error: {e}")
-
-
-# -------------------------
-# Indicators / signal helpers
-# Step 3 foundation: reusable book-derived signal engine
-# -------------------------
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    return true_range(df).ewm(alpha=1 / period, adjust=False).mean()
-
-
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    up_move = df["high"].diff()
-    down_move = -df["low"].diff()
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr = true_range(df).replace(0, np.nan)
-    atr_n = tr.ewm(alpha=1 / period, adjust=False).mean()
-
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_n
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_n
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
-    return dx.ewm(alpha=1 / period, adjust=False).mean()
-
-
-def stochastic_k(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    low_n = df["low"].rolling(period).min()
-    high_n = df["high"].rolling(period).max()
-    return 100 * (df["close"] - low_n) / (high_n - low_n).replace(0, np.nan)
-
-
-def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    low_n = df["low"].rolling(period).min()
-    high_n = df["high"].rolling(period).max()
-    return -100 * (high_n - df["close"]) / (high_n - low_n).replace(0, np.nan)
-
-
-def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    sma = tp.rolling(period).mean()
-    mad = (tp - sma).abs().rolling(period).mean()
-    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
-
-
-def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    raw = tp * df["volume"]
-    direction = tp.diff()
-    pos_flow = pd.Series(np.where(direction > 0, raw, 0.0), index=df.index)
-    neg_flow = pd.Series(np.where(direction < 0, raw, 0.0), index=df.index)
-    pos_sum = pos_flow.rolling(period).sum()
-    neg_sum = neg_flow.rolling(period).sum()
-    mr = pos_sum / neg_sum.replace(0, np.nan)
-    return 100 - (100 / (1 + mr))
-
-
-def obv(df: pd.DataFrame) -> pd.Series:
-    direction = np.sign(df["close"].diff().fillna(0))
-    return (direction * df["volume"]).fillna(0).cumsum()
-
-
-def adl(df: pd.DataFrame) -> pd.Series:
-    hl = (df["high"] - df["low"]).replace(0, np.nan)
-    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / hl
-    mfv = mfm.fillna(0) * df["volume"]
-    return mfv.cumsum()
-
-
-def cmf(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    hl = (df["high"] - df["low"]).replace(0, np.nan)
-    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / hl
-    mfv = mfm.fillna(0) * df["volume"]
-    return mfv.rolling(period).sum() / df["volume"].rolling(period).sum().replace(0, np.nan)
-
-
-def vpt(df: pd.DataFrame) -> pd.Series:
-    return (df["volume"] * (df["close"].pct_change().fillna(0))).cumsum()
-
-
-def linear_slope(series: pd.Series, window: int) -> pd.Series:
-    vals = series.values
-    out = np.full(len(series), np.nan)
-    x = np.arange(window, dtype=float)
-    x_mean = x.mean()
-    denom = ((x - x_mean) ** 2).sum()
-    for i in range(window - 1, len(series)):
-        y = vals[i - window + 1:i + 1]
-        if np.isnan(y).any():
-            continue
-        y_mean = y.mean()
-        out[i] = ((x - x_mean) * (y - y_mean)).sum() / denom
-    return pd.Series(out, index=series.index)
-
-
-def session_vwap(df: pd.DataFrame) -> pd.Series:
-    pv = (df["close"] * df["volume"]).cumsum()
-    vv = df["volume"].cumsum().replace(0, np.nan)
-    return pv / vv
-
-
-def detect_candles(df: pd.DataFrame) -> pd.DataFrame:
-    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
-    prev_o = o.shift(1)
-    prev_c = c.shift(1)
-
-    body = (c - o).abs()
-    rng = (h - l).replace(0, np.nan)
-    upper = h - pd.concat([o, c], axis=1).max(axis=1)
-    lower = pd.concat([o, c], axis=1).min(axis=1) - l
-
-    out = pd.DataFrame(index=df.index)
-    out["cdl_doji"] = (body / rng < 0.1).astype(int)
-    out["cdl_hammer"] = ((lower / rng > 0.5) & (upper / rng < 0.15) & (c > o)).astype(int)
-    out["cdl_shooting_star"] = ((upper / rng > 0.5) & (lower / rng < 0.15) & (c < o)).astype(int)
-    out["cdl_bull_engulf"] = ((prev_c < prev_o) & (c > o) & (o <= prev_c) & (c >= prev_o)).astype(int)
-    out["cdl_bear_engulf"] = ((prev_c > prev_o) & (c < o) & (o >= prev_c) & (c <= prev_o)).astype(int)
-    out["cdl_inside_bar"] = ((h < h.shift(1)) & (l > l.shift(1))).astype(int)
-    out["cdl_outside_bar"] = ((h > h.shift(1)) & (l < l.shift(1))).astype(int)
-
-    out["cdl_morning_star"] = (
-        (c.shift(2) < o.shift(2))
-        & ((c.shift(1) - o.shift(1)).abs() < (h.shift(1) - l.shift(1)) * 0.2)
-        & (c > o)
-        & (c > ((o.shift(2) + c.shift(2)) / 2))
-    ).astype(int)
-
-    out["cdl_evening_star"] = (
-        (c.shift(2) > o.shift(2))
-        & ((c.shift(1) - o.shift(1)).abs() < (h.shift(1) - l.shift(1)) * 0.2)
-        & (c < o)
-        & (c < ((o.shift(2) + c.shift(2)) / 2))
-    ).astype(int)
-
-    out["cdl_three_white_soldiers"] = (
-        (c > o) & (c.shift(1) > o.shift(1)) & (c.shift(2) > o.shift(2))
-        & (c > c.shift(1)) & (c.shift(1) > c.shift(2))
-    ).astype(int)
-
-    out["cdl_three_black_crows"] = (
-        (c < o) & (c.shift(1) < o.shift(1)) & (c.shift(2) < o.shift(2))
-        & (c < c.shift(1)) & (c.shift(1) < c.shift(2))
-    ).astype(int)
-
-    return out
-
-
-# -------------------------
-# Data fetch / normalization
-# -------------------------
-def normalize_bars(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-
-    if isinstance(df.index, pd.MultiIndex):
-        if "symbol" in df.index.names:
-            try:
-                df = df.xs(symbol, level="symbol")
-            except Exception:
-                try:
-                    df = df.reset_index()
-                    df = df[df["symbol"] == symbol].copy()
-                except Exception:
-                    pass
-
-    df = df.copy().reset_index()
-
-    if "timestamp" not in df.columns:
-        if "index" in df.columns:
-            df = df.rename(columns={"index": "timestamp"})
-        elif "time" in df.columns:
-            df = df.rename(columns={"time": "timestamp"})
-
-    expected = ["timestamp", "open", "high", "low", "close", "volume"]
-    for col in expected:
-        if col not in df.columns:
-            raise RuntimeError(f"Missing column '{col}' for {symbol}")
-
-    if "trade_count" not in df.columns:
-        if "n" in df.columns:
-            df["trade_count"] = df["n"]
-        else:
-            df["trade_count"] = 0.0
-
-    if "vwap" not in df.columns:
-        df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    df["symbol"] = symbol
-
-    numeric_cols = ["open", "high", "low", "close", "volume", "trade_count", "vwap"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df.dropna(subset=["open", "high", "low", "close", "volume"])
-
-
-def get_bars(symbol: str, limit: int = LOOKBACK_BARS) -> pd.DataFrame:
-    try:
-        bars = api.get_bars(symbol, TIMEFRAME, limit=limit).df
-        return normalize_bars(bars, symbol)
-    except Exception as e:
-        log(f"Data fetch failed for {symbol}: {e}")
-        return pd.DataFrame()
-
-
-# -------------------------
-# Feature engineering
-# -------------------------
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or len(df) < 120:
-        return pd.DataFrame()
-
-    x = df.copy()
-    x["ret_1"] = x["close"].pct_change(1)
-    x["ret_3"] = x["close"].pct_change(3)
-    x["ret_5"] = x["close"].pct_change(5)
-    x["ret_10"] = x["close"].pct_change(10)
-    x["ret_20"] = x["close"].pct_change(20)
-    x["logret_1"] = np.log(x["close"] / x["close"].shift(1))
-
-    x["range_pct"] = (x["high"] - x["low"]) / x["close"]
-    x["body_pct"] = (x["close"] - x["open"]).abs() / x["close"]
-    x["upper_wick_pct"] = (x["high"] - x[["open", "close"]].max(axis=1)) / x["close"]
-    x["lower_wick_pct"] = (x[["open", "close"]].min(axis=1) - x["low"]) / x["close"]
-    x["close_pos_in_bar"] = (x["close"] - x["low"]) / (x["high"] - x["low"]).replace(0, np.nan)
-    x["gap_pct"] = (x["open"] - x["close"].shift(1)) / x["close"].shift(1)
-
-    x["tr"] = true_range(x)
-    x["tr_pct"] = x["tr"] / x["close"]
-    x["atr14"] = atr(x, 14)
-    x["atr20"] = atr(x, 20)
-    x["atr14_pct"] = x["atr14"] / x["close"]
-    x["atr20_pct"] = x["atr20"] / x["close"]
-    x["atr_ratio"] = x["atr14"] / x["atr20"].replace(0, np.nan)
-
-    x["volatility_5"] = x["ret_1"].rolling(5).std()
-    x["volatility_10"] = x["ret_1"].rolling(10).std()
-    x["volatility_20"] = x["ret_1"].rolling(20).std()
-
-    x["zscore_20"] = (x["close"] - x["close"].rolling(20).mean()) / x["close"].rolling(20).std().replace(0, np.nan)
-    x["zscore_50"] = (x["close"] - x["close"].rolling(50).mean()) / x["close"].rolling(50).std().replace(0, np.nan)
-
-    for n in [5, 10, 20, 50, 100]:
-        x[f"sma_{n}"] = x["close"].rolling(n).mean()
-        x[f"dist_sma_{n}"] = (x["close"] - x[f"sma_{n}"]) / x[f"sma_{n}"]
-
-    for n in [8, 12, 21, 34, 55]:
-        x[f"ema_{n}"] = x["close"].ewm(span=n, adjust=False).mean()
-        x[f"dist_ema_{n}"] = (x["close"] - x[f"ema_{n}"]) / x[f"ema_{n}"]
-
-    x["sma_cross_5_20"] = (x["sma_5"] - x["sma_20"]) / x["sma_20"]
-    x["ema_cross_12_26"] = (x["close"].ewm(span=12, adjust=False).mean() - x["close"].ewm(span=26, adjust=False).mean()) / x["close"]
-    x["ema_slope_8"] = linear_slope(x["ema_8"], 8)
-    x["ema_slope_21"] = linear_slope(x["ema_21"], 10)
-    x["ema_slope_55"] = linear_slope(x["ema_55"], 12)
-
-    bb_mid = x["close"].rolling(20).mean()
-    bb_std = x["close"].rolling(20).std()
-    bb_up = bb_mid + 2 * bb_std
-    bb_dn = bb_mid - 2 * bb_std
-    x["bb_width"] = (bb_up - bb_dn) / bb_mid.replace(0, np.nan)
-    x["bb_pos"] = (x["close"] - bb_dn) / (bb_up - bb_dn).replace(0, np.nan)
-
-    ema20 = x["close"].ewm(span=20, adjust=False).mean()
-    kc_up = ema20 + 2 * x["atr20"]
-    kc_dn = ema20 - 2 * x["atr20"]
-    x["keltner_width"] = (kc_up - kc_dn) / ema20.replace(0, np.nan)
-
-    dc_high = x["high"].rolling(20).max()
-    dc_low = x["low"].rolling(20).min()
-    x["donchian_pos"] = (x["close"] - dc_low) / (dc_high - dc_low).replace(0, np.nan)
-    x["breakout_20_up"] = (x["close"] > dc_high.shift(1)).astype(int)
-    x["breakout_20_down"] = (x["close"] < dc_low.shift(1)).astype(int)
-
-    x["rsi_14"] = rsi(x["close"], 14)
-    x["stoch_k_14"] = stochastic_k(x, 14)
-    x["stoch_d_3"] = x["stoch_k_14"].rolling(3).mean()
-    x["willr_14"] = williams_r(x, 14)
-    x["cci_20"] = cci(x, 20)
-    x["adx_14"] = adx(x, 14)
-
-    ema12 = x["close"].ewm(span=12, adjust=False).mean()
-    ema26 = x["close"].ewm(span=26, adjust=False).mean()
-    x["macd"] = ema12 - ema26
-    x["macd_signal"] = x["macd"].ewm(span=9, adjust=False).mean()
-    x["macd_hist"] = x["macd"] - x["macd_signal"]
-
-    x["mfi_14"] = mfi(x, 14)
-    x["obv"] = obv(x)
-    x["obv_slope_10"] = linear_slope(x["obv"], 10)
-    x["adl"] = adl(x)
-    x["adl_slope_10"] = linear_slope(x["adl"], 10)
-    x["cmf_20"] = cmf(x, 20)
-    x["vpt"] = vpt(x)
-    x["vpt_slope_10"] = linear_slope(x["vpt"], 10)
-
-    x["rel_volume_5"] = x["volume"] / x["volume"].rolling(5).mean().replace(0, np.nan)
-    x["rel_volume_10"] = x["volume"] / x["volume"].rolling(10).mean().replace(0, np.nan)
-    x["rel_volume_20"] = x["volume"] / x["volume"].rolling(20).mean().replace(0, np.nan)
-    x["volume_z_20"] = (x["volume"] - x["volume"].rolling(20).mean()) / x["volume"].rolling(20).std().replace(0, np.nan)
-    x["trade_count_z_20"] = (x["trade_count"] - x["trade_count"].rolling(20).mean()) / x["trade_count"].rolling(20).std().replace(0, np.nan)
-    x["dollar_volume"] = x["close"] * x["volume"]
-    x["dollar_volume_ma20"] = x["dollar_volume"].rolling(20).mean()
-
-    x["vwap_dist"] = (x["close"] - x["vwap"]) / x["vwap"].replace(0, np.nan)
-    x["session_vwap"] = session_vwap(x)
-    x["session_vwap_dist"] = (x["close"] - x["session_vwap"]) / x["session_vwap"].replace(0, np.nan)
-
-    x["minute_of_session"] = np.arange(len(x))
-    x["minute_norm"] = x["minute_of_session"] / max(len(x), 1)
-
-    candle_df = detect_candles(x)
-    x = pd.concat([x, candle_df], axis=1)
-
-    x["support_20"] = x["low"].rolling(20).min()
-    x["resistance_20"] = x["high"].rolling(20).max()
-    x["dist_support_20"] = (x["close"] - x["support_20"]) / x["close"]
-    x["dist_resistance_20"] = (x["resistance_20"] - x["close"]) / x["close"]
-
-    x["future_return"] = x["close"].shift(-LABEL_HORIZON) / x["close"] - 1
-    x["target"] = (x["future_return"] > LABEL_THRESHOLD).astype(int)
-
-    x = x.replace([np.inf, -np.inf], np.nan)
-    return x
-
-
-FEATURE_COLUMNS = [
-    "ret_1", "ret_3", "ret_5", "ret_10", "ret_20", "logret_1",
-    "range_pct", "body_pct", "upper_wick_pct", "lower_wick_pct", "close_pos_in_bar", "gap_pct",
-    "tr_pct", "atr14_pct", "atr20_pct", "atr_ratio",
-    "volatility_5", "volatility_10", "volatility_20",
-    "zscore_20", "zscore_50",
-    "dist_sma_5", "dist_sma_10", "dist_sma_20", "dist_sma_50", "dist_sma_100",
-    "dist_ema_8", "dist_ema_12", "dist_ema_21", "dist_ema_34", "dist_ema_55",
-    "sma_cross_5_20", "ema_cross_12_26", "ema_slope_8", "ema_slope_21", "ema_slope_55",
-    "bb_width", "bb_pos", "keltner_width", "donchian_pos", "breakout_20_up", "breakout_20_down",
-    "rsi_14", "stoch_k_14", "stoch_d_3", "willr_14", "cci_20", "adx_14",
-    "macd", "macd_signal", "macd_hist",
-    "mfi_14", "obv_slope_10", "adl_slope_10", "cmf_20", "vpt_slope_10",
-    "rel_volume_5", "rel_volume_10", "rel_volume_20", "volume_z_20", "trade_count_z_20",
-    "vwap_dist", "session_vwap_dist", "minute_norm",
-    "cdl_doji", "cdl_hammer", "cdl_shooting_star", "cdl_bull_engulf", "cdl_bear_engulf",
-    "cdl_inside_bar", "cdl_outside_bar", "cdl_morning_star", "cdl_evening_star",
-    "cdl_three_white_soldiers", "cdl_three_black_crows",
-    "dist_support_20", "dist_resistance_20"
-]
-
-
-# -------------------------
-# Training data build / persistence
-# -------------------------
-def make_training_rows(feature_df: pd.DataFrame) -> pd.DataFrame:
-    if feature_df.empty:
-        return pd.DataFrame()
-
-    needed = ["timestamp", "symbol", "close", "future_return", "target"] + FEATURE_COLUMNS
-    rows = feature_df[needed].copy()
-    rows = rows.iloc[:-LABEL_HORIZON].copy() if len(rows) > LABEL_HORIZON else pd.DataFrame()
-    if rows.empty:
-        return rows
-
-    rows = rows.dropna(subset=FEATURE_COLUMNS + ["target"])
-    rows["target"] = rows["target"].astype(int)
-    return rows
-
-
-def rebuild_symbol_training_data(symbol: str) -> pd.DataFrame:
-    bars = get_bars(symbol, LOOKBACK_BARS)
-    if bars.empty:
-        return pd.DataFrame()
-    feats = build_features(bars)
-    return make_training_rows(feats)
-
-
-def update_training_store(symbols) -> int:
-    parts = []
-    for s in symbols:
-        try:
-            df = rebuild_symbol_training_data(s)
-            if not df.empty:
-                parts.append(df)
-        except Exception as e:
-            log(f"Training build failed for {s}: {e}")
-
-    if not parts:
-        return 0
-
-    batch = pd.concat(parts, ignore_index=True)
-    batch["timestamp"] = pd.to_datetime(batch["timestamp"], utc=True).astype(str)
-
-    return append_df(
-        TRAIN_DATA_FILE,
-        batch,
-        dedupe_cols=["symbol", "timestamp"],
-        max_rows=MAX_TRAIN_ROWS,
-    )
-
-
-def load_training_data() -> pd.DataFrame:
-    if not TRAIN_DATA_FILE.exists():
-        return pd.DataFrame()
-    df = pd.read_csv(TRAIN_DATA_FILE)
-    if df.empty:
-        return df
-    df = df.dropna(subset=FEATURE_COLUMNS + ["target"])
-    df["target"] = df["target"].astype(int)
-    return df
-
-
-def load_model():
-    if MODEL_FILE.exists():
-        with open(MODEL_FILE, "rb") as f:
-            return pickle.load(f)
-    return None
-
-
-def load_model_meta():
-    return load_json(
-        MODEL_META_FILE,
-        default={
-            "trained_at": None,
-            "train_rows": 0,
-            "new_rows_since_train": 0,
-            "feature_count": len(FEATURE_COLUMNS),
-            "model_type": "RandomForestClassifier",
-        },
-    )
-
-
-def save_model(model, meta: dict) -> None:
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(model, f)
-    save_json(MODEL_META_FILE, meta)
-
-
-def train_or_load_model(force=False):
-    meta = load_model_meta()
-    model = load_model()
-    train_df = load_training_data()
-
-    need_train = force or model is None
-    if meta.get("new_rows_since_train", 0) >= RETRAIN_EVERY_N_NEW_ROWS:
-        need_train = True
-
-    if len(train_df) < MIN_TRAIN_ROWS and model is None:
-        log(f"Not enough train rows yet: {len(train_df)}")
-        return None, meta
-
-    if not need_train and model is not None:
-        return model, meta
-
-    if len(train_df) < MIN_TRAIN_ROWS:
-        log(f"Not enough train rows to retrain yet: {len(train_df)}")
-        return model, meta
-
-    X = train_df[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y = train_df["target"].astype(int)
-
-    log(f"Training model on {len(train_df)} rows | positive rate={y.mean():.3f}")
-
-    model = RandomForestClassifier(
-        n_estimators=280,
-        max_depth=8,
-        min_samples_leaf=12,
-        min_samples_split=20,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        class_weight="balanced_subsample",
-    )
-    model.fit(X, y)
-
-    meta = {
-        "trained_at": datetime.utcnow().isoformat(),
-        "train_rows": int(len(train_df)),
-        "new_rows_since_train": 0,
-        "feature_count": len(FEATURE_COLUMNS),
-        "model_type": "RandomForestClassifier",
+# -----------------------------
+# Persistent state
+# -----------------------------
+def default_state() -> Dict:
+    return {
+        "date": "",
+        "trades_today": 0,
+        "losing_trades_today": 0,
+        "realized_net_pnl_today": 0.0,
+        "daily_start_equity": 0.0,
+        "symbols_traded_today": [],
+        "positions": {},
+        "last_scan_candidates": [],
+        "kill_switch": False,
+        "kill_switch_reason": ""
     }
-    save_model(model, meta)
-    return model, meta
 
 
-# -------------------------
-# Adaptive thresholds from trade history
-# -------------------------
-def load_trade_history() -> pd.DataFrame:
-    if not TRADE_HISTORY_FILE.exists():
-        return pd.DataFrame()
-    return pd.read_csv(TRADE_HISTORY_FILE)
+def load_state() -> Dict:
+    ensure_dirs()
+    if not os.path.exists(STATE_FILE):
+        return default_state()
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def adaptive_buy_threshold() -> float:
-    df = load_trade_history()
-    if df.empty or len(df) < 25 or "net_pnl_pct" not in df.columns:
-        return MIN_PROB_TO_BUY
-
-    recent = df.tail(50).copy()
-    win_rate = (recent["net_pnl_pct"] > 0).mean()
-    avg_pnl = recent["net_pnl_pct"].mean()
-
-    threshold = MIN_PROB_TO_BUY
-    if win_rate < 0.45 or avg_pnl < 0:
-        threshold += 0.03
-    elif win_rate > 0.60 and avg_pnl > 0.003:
-        threshold -= 0.02
-
-    return max(0.55, min(0.67, threshold))
+def save_state(state: Dict) -> None:
+    ensure_dirs()
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
 
-# -------------------------
-# Position state persistence
-# -------------------------
-def load_open_state() -> dict:
-    return load_json(OPEN_STATE_FILE, default={})
-
-
-def save_open_state(state: dict) -> None:
-    save_json(OPEN_STATE_FILE, state)
-
-
-def sync_open_state_with_broker():
-    state = load_open_state()
-    positions = get_positions_dict()
-    for sym in list(state.keys()):
-        if sym not in positions:
-            state.pop(sym, None)
-
-    for sym, pos in positions.items():
-        if sym not in state:
-            state[sym] = {
-                "entry_time": datetime.utcnow().isoformat(),
-                "entry_price": safe_float(pos.avg_entry_price, 0.0),
-                "qty": safe_float(pos.qty, 0.0),
-                "highest_price": safe_float(pos.current_price, safe_float(pos.avg_entry_price, 0.0)),
-                "entry_score": None,
-                "entry_reason": "synced_from_broker",
-            }
-
-    save_open_state(state)
+def reset_daily_state_if_needed(state: Dict) -> Dict:
+    today = now_et().strftime("%Y-%m-%d")
+    if state.get("date") != today:
+        equity = get_account_equity()
+        new_state = default_state()
+        new_state["date"] = today
+        new_state["daily_start_equity"] = equity
+        save_state(new_state)
+        log(f"Daily state reset. Start equity={equity:.2f}")
+        return new_state
     return state
 
 
-# -------------------------
-# Step 2: multi-stage scan
-# -------------------------
-def quick_scan(symbol: str):
-    bars = get_bars(symbol, 70)
-    if bars.empty or len(bars) < 45:
-        return None
+# -----------------------------
+# Logs
+# -----------------------------
+TRADE_COLUMNS = [
+    "timestamp_et", "symbol", "direction", "event", "qty",
+    "entry_order_id", "entry_price_est", "entry_price_fill",
+    "stop_price", "target_price",
+    "exit_order_id", "exit_price_est", "exit_price_fill",
+    "reason", "gross_pnl", "sec_fee", "net_pnl",
+    "score", "relative_volume", "range_pct",
+    "spy_regime", "pattern_tags"
+]
 
-    last = bars.iloc[-1]
-    close_px = safe_float(last["close"], 0.0)
-    if close_px < MIN_PRICE or close_px > MAX_PRICE:
-        return None
-
-    bars["dollar_volume"] = bars["close"] * bars["volume"]
-    dollar_volume_ma20 = safe_float(bars["dollar_volume"].tail(20).mean(), 0.0)
-    if dollar_volume_ma20 < MIN_DOLLAR_VOLUME:
-        return None
-
-    ret20 = safe_float((bars["close"].iloc[-1] / bars["close"].iloc[-21] - 1.0) if len(bars) > 20 else 0.0, 0.0)
-    relvol = safe_float(last["volume"] / bars["volume"].tail(20).mean(), 1.0)
-    intrabar_range = safe_float((last["high"] - last["low"]) / last["close"], 0.0)
-
-    if intrabar_range < 0.002:
-        return None
-
-    return {
-        "symbol": symbol,
-        "close": close_px,
-        "dollar_volume_ma20": dollar_volume_ma20,
-        "ret20": ret20,
-        "relvol": relvol,
-        "intrabar_range": intrabar_range,
-    }
+SIGNAL_COLUMNS = [
+    "timestamp_et", "symbol", "direction", "latest_price",
+    "opening_open", "opening_high", "opening_low", "opening_close",
+    "opening_volume", "relative_volume", "range_pct",
+    "body_fraction", "close_position", "adaptive_score",
+    "base_score", "score", "spy_regime", "pattern_tags", "action"
+]
 
 
-def build_stage1_universe(symbols):
-    rows = []
-    for s in symbols:
-        try:
-            r = quick_scan(s)
-            if r:
-                rows.append(r)
-        except Exception as e:
-            log(f"Quick scan failed for {s}: {e}")
-
-    if not rows:
-        return []
-
-    df = pd.DataFrame(rows)
-    df["rank_score"] = (
-        df["relvol"].clip(0, 5) * 0.45
-        + df["intrabar_range"].clip(0, 0.08) * 8.0
-        + df["ret20"].clip(-0.2, 0.2) * 1.5
-    )
-    return df.sort_values("rank_score", ascending=False).head(MAX_STAGE1_SYMBOLS)["symbol"].tolist()
+# -----------------------------
+# Market / account
+# -----------------------------
+def market_is_open() -> bool:
+    return bool(api.get_clock().is_open)
 
 
-# -------------------------
-# Step 4: vetting + scoring
-# -------------------------
-def reason_flags(row: pd.Series):
-    reasons_yes = []
-    reasons_no = []
-
-    if safe_float(row.get("ema_slope_21")) > 0:
-        reasons_yes.append("EMA21 rising")
-    else:
-        reasons_no.append("EMA21 flat/down")
-
-    if safe_float(row.get("session_vwap_dist")) > 0:
-        reasons_yes.append("Above session VWAP")
-    else:
-        reasons_no.append("Below session VWAP")
-
-    if safe_float(row.get("rel_volume_20")) >= 1.05:
-        reasons_yes.append("Volume expansion")
-    else:
-        reasons_no.append("Weak relative volume")
-
-    if safe_float(row.get("adx_14")) >= 16:
-        reasons_yes.append("Trend strength OK")
-    else:
-        reasons_no.append("Weak ADX")
-
-    if safe_float(row.get("dist_resistance_20")) >= 0.006:
-        reasons_yes.append("Room to resistance")
-    else:
-        reasons_no.append("Too near resistance")
-
-    if safe_float(row.get("zscore_20")) <= 2.2:
-        reasons_yes.append("Not overextended")
-    else:
-        reasons_no.append("Overextended")
-
-    if safe_float(row.get("bb_width")) <= 0.12:
-        reasons_yes.append("Compression structure")
-    else:
-        reasons_no.append("Wide/loose structure")
-
-    if int(safe_float(row.get("cdl_bull_engulf"))) == 1:
-        reasons_yes.append("Bull engulf")
-    if int(safe_float(row.get("cdl_hammer"))) == 1:
-        reasons_yes.append("Hammer")
-    if int(safe_float(row.get("breakout_20_up"))) == 1:
-        reasons_yes.append("20-bar breakout")
-    if int(safe_float(row.get("cdl_bear_engulf"))) == 1:
-        reasons_no.append("Bear engulf present")
-
-    return reasons_yes, reasons_no
+def get_account_equity() -> float:
+    return safe_float(api.get_account().equity)
 
 
-def latest_feature_row(symbol: str):
-    bars = get_bars(symbol, LOOKBACK_BARS)
-    if bars.empty:
-        return None, None
-    feats = build_features(bars)
-    if feats.empty:
-        return None, None
-    row = feats.iloc[-1].copy()
-
-    dollar_volume = safe_float(row.get("dollar_volume_ma20", 0.0))
-    close_px = safe_float(row.get("close", 0.0))
-    if close_px < MIN_PRICE or close_px > MAX_PRICE:
-        return None, None
-    if dollar_volume < MIN_DOLLAR_VOLUME:
-        return None, None
-    return row, bars
+def get_buying_power() -> float:
+    return safe_float(api.get_account().buying_power)
 
 
-def evaluate_candidate(model, symbol: str):
-    row, bars = latest_feature_row(symbol)
-    if row is None:
-        return None
-
-    X = pd.DataFrame([row[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)])
+def get_current_positions() -> Dict[str, Dict]:
+    positions = {}
     try:
-        prob = float(model.predict_proba(X)[0][1]) if model is not None else 0.5
+        for p in api.list_positions():
+            qty_signed = int(float(p.qty))
+            positions[p.symbol] = {
+                "symbol": p.symbol,
+                "signed_qty": qty_signed,
+                "qty": abs(qty_signed),
+                "side": "long" if qty_signed > 0 else "short",
+                "avg_entry_price": safe_float(p.avg_entry_price),
+                "current_price": safe_float(p.current_price),
+                "market_value": safe_float(p.market_value),
+                "unrealized_pl": safe_float(p.unrealized_pl)
+            }
+    except Exception as e:
+        log(f"Could not list positions: {e}")
+    return positions
+
+
+def is_entry_window(current_et: datetime) -> bool:
+    start = current_et.replace(hour=9, minute=35, second=0, microsecond=0)
+    end = current_et.replace(hour=FORCE_EXIT_HOUR, minute=FORCE_EXIT_MINUTE, second=0, microsecond=0)
+    return start <= current_et < end
+
+
+def is_force_exit_time(current_et: datetime) -> bool:
+    cutoff = current_et.replace(hour=FORCE_EXIT_HOUR, minute=FORCE_EXIT_MINUTE, second=0, microsecond=0)
+    return current_et >= cutoff
+
+
+# -----------------------------
+# Data retrieval
+# -----------------------------
+def get_minute_bars(symbol: str, minutes_back: int = 90) -> pd.DataFrame:
+    end_utc = datetime.now(UTC)
+    start_utc = end_utc - timedelta(minutes=minutes_back + 20)
+
+    bars = api.get_bars(
+        symbol,
+        tradeapi.TimeFrame.Minute,
+        start=start_utc.isoformat(),
+        end=end_utc.isoformat(),
+        adjustment="raw"
+    ).df
+
+    if bars.empty:
+        return bars
+
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol, level=0)
+
+    bars = bars.copy()
+    bars.index = pd.to_datetime(bars.index, utc=True).tz_convert(EASTERN)
+    return bars
+
+
+def get_daily_bars(symbol: str, days: int = 20) -> pd.DataFrame:
+    end_utc = datetime.now(UTC)
+    start_utc = end_utc - timedelta(days=days + 10)
+
+    bars = api.get_bars(
+        symbol,
+        tradeapi.TimeFrame.Day,
+        start=start_utc.isoformat(),
+        end=end_utc.isoformat(),
+        adjustment="raw"
+    ).df
+
+    if bars.empty:
+        return bars
+
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol, level=0)
+
+    bars = bars.copy()
+    bars.index = pd.to_datetime(bars.index, utc=True).tz_convert(EASTERN)
+    return bars
+
+
+def get_latest_trade_price(symbol: str) -> Optional[float]:
+    try:
+        t = api.get_latest_trade(symbol)
+        return safe_float(t.price, None)
     except Exception:
-        prob = 0.5
+        return None
 
-    reasons_yes, _ = reason_flags(row)
-    penalty = 0.0
-    boost = 0.0
-    reject_reasons = []
 
-    if safe_float(row["adx_14"]) < 12:
-        penalty += 0.02
-        reject_reasons.append("ADX too weak")
-    if safe_float(row["rel_volume_20"]) < 0.85:
-        penalty += 0.02
-        reject_reasons.append("Relative volume too weak")
-    if safe_float(row["dist_resistance_20"]) < 0.004:
-        penalty += 0.025
-        reject_reasons.append("Too close to resistance")
-    if safe_float(row["atr14_pct"]) > 0.045:
-        penalty += 0.02
-        reject_reasons.append("Volatility too high")
-    if safe_float(row["zscore_20"]) > 2.5:
-        penalty += 0.03
-        reject_reasons.append("Too extended")
-    if safe_float(row["ema_slope_21"]) <= 0:
-        penalty += 0.015
-        reject_reasons.append("EMA21 not rising")
-    if safe_float(row["session_vwap_dist"]) <= -0.002:
-        penalty += 0.02
-        reject_reasons.append("Below VWAP")
-    if safe_float(row["bb_width"]) > 0.18:
-        penalty += 0.01
-        reject_reasons.append("Structure too loose")
+# -----------------------------
+# Opening candle / image-style signal
+# -----------------------------
+def filter_today_regular_session(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    today = now_et().date()
+    df = df[df.index.date == today]
+    df = df[
+        (df.index.time >= datetime.strptime("09:30", "%H:%M").time()) &
+        (df.index.time <= datetime.strptime("16:00", "%H:%M").time())
+    ]
+    return df
 
-    if safe_float(row["ema_slope_21"]) > 0:
-        boost += 0.01
-    if safe_float(row["session_vwap_dist"]) > 0:
-        boost += 0.01
-    if int(safe_float(row["cdl_bull_engulf"])) == 1 or int(safe_float(row["cdl_hammer"])) == 1:
-        boost += 0.01
-    if int(safe_float(row["breakout_20_up"])) == 1:
-        boost += 0.01
-    if safe_float(row["rel_volume_20"]) > 1.25:
-        boost += 0.01
-    if safe_float(row["dist_support_20"]) > 0.005:
-        boost += 0.005
 
-    final_prob = max(0.01, min(0.99, prob + boost - penalty))
-    accepted = len(reject_reasons) == 0
+def build_opening_5m_candle(minute_bars: pd.DataFrame) -> Optional[Dict]:
+    df = filter_today_regular_session(minute_bars)
+    if df.empty:
+        return None
+
+    first_five = df[
+        (df.index.time >= datetime.strptime("09:30", "%H:%M").time()) &
+        (df.index.time < datetime.strptime("09:35", "%H:%M").time())
+    ]
+
+    if len(first_five) < 5:
+        return None
+
+    open_ = float(first_five.iloc[0]["open"])
+    high_ = float(first_five["high"].max())
+    low_ = float(first_five["low"].min())
+    close_ = float(first_five.iloc[-1]["close"])
+    volume_ = float(first_five["volume"].sum())
+
+    candle_range = max(high_ - low_, 0.0001)
+    body = abs(close_ - open_)
+    body_fraction = body / candle_range
+
+    upper_wick = high_ - max(open_, close_)
+    lower_wick = min(open_, close_) - low_
+
+    close_position = (close_ - low_) / candle_range  # 0 near low, 1 near high
+
+    direction = "long" if close_ > open_ else "short"
+
+    opposite_wick_fraction = (
+        lower_wick / candle_range if direction == "long" else upper_wick / candle_range
+    )
 
     return {
-        "symbol": symbol,
-        "prob_raw": prob,
-        "prob": final_prob,
-        "price": safe_float(row["close"]),
-        "adx_14": safe_float(row["adx_14"]),
-        "atr14_pct": safe_float(row["atr14_pct"]),
-        "rel_volume_20": safe_float(row["rel_volume_20"]),
-        "session_vwap_dist": safe_float(row["session_vwap_dist"]),
-        "dist_resistance_20": safe_float(row["dist_resistance_20"]),
-        "zscore_20": safe_float(row["zscore_20"]),
-        "accepted": accepted,
-        "accept_reason": "; ".join(reasons_yes[:6]) if reasons_yes else "",
-        "reject_reason": "; ".join(reject_reasons) if reject_reasons else "",
-        "feature_row": row,
-        "bars": bars,
+        "open": open_,
+        "high": high_,
+        "low": low_,
+        "close": close_,
+        "volume": volume_,
+        "range": candle_range,
+        "range_pct": candle_range / max(open_, 0.0001),
+        "body_fraction": body_fraction,
+        "close_position": close_position,
+        "upper_wick_fraction": upper_wick / candle_range,
+        "lower_wick_fraction": lower_wick / candle_range,
+        "opposite_wick_fraction": opposite_wick_fraction,
+        "direction": direction
     }
 
 
-def score_candidates(model, symbols):
-    rows = []
-    for s in symbols:
-        try:
-            result = evaluate_candidate(model, s)
-            if result:
-                rows.append(result)
-        except Exception as e:
-            log(f"Candidate eval failed for {s}: {e}")
+def opening_candle_is_valid(opening: Dict) -> bool:
+    if opening["range_pct"] < MIN_5M_RANGE_PCT or opening["range_pct"] > MAX_5M_RANGE_PCT:
+        return False
+    if opening["body_fraction"] < MIN_BODY_FRACTION:
+        return False
+    if opening["opposite_wick_fraction"] > MAX_OPPOSITE_WICK_FRACTION:
+        return False
 
-    if not rows:
+    if opening["direction"] == "long":
+        if opening["close_position"] < MIN_CLOSE_NEAR_EXTREME:
+            return False
+    else:
+        if opening["close_position"] > (1.0 - MIN_CLOSE_NEAR_EXTREME):
+            return False
+
+    return True
+
+
+def build_image_style_trade_levels(opening: Dict, latest_price: float) -> Dict:
+    """
+    Signal structure based on the user's image logic:
+    stop -> entry -> target defined by the opening 5m signal bar
+    """
+    buffer_amt = max(latest_price * ENTRY_BUFFER_PCT, MIN_ENTRY_BUFFER_DOLLARS)
+
+    if opening["direction"] == "long":
+        stop_price = opening["low"] - buffer_amt
+        entry_price = opening["high"] + buffer_amt
+        risk_per_share = entry_price - stop_price
+        target_price = entry_price + TARGET_R_MULTIPLE * risk_per_share
+    else:
+        stop_price = opening["high"] + buffer_amt
+        entry_price = opening["low"] - buffer_amt
+        risk_per_share = stop_price - entry_price
+        target_price = entry_price - TARGET_R_MULTIPLE * risk_per_share
+
+    return {
+        "direction": opening["direction"],
+        "entry_price": round(entry_price, 4),
+        "stop_price": round(stop_price, 4),
+        "target_price": round(target_price, 4),
+        "risk_per_share": round(risk_per_share, 4),
+        "risk_per_share_pct": round(risk_per_share / max(entry_price, 0.0001), 4)
+    }
+
+
+def breakout_is_confirmed(symbol: str, opening: Dict, minute_bars: pd.DataFrame) -> bool:
+    """
+    Require that price is on the breakout side after 9:35 and not merely touching.
+    """
+    df = filter_today_regular_session(minute_bars)
+    if df.empty:
+        return False
+
+    post_opening = df[df.index.time >= datetime.strptime("09:35", "%H:%M").time()]
+    if post_opening.empty:
+        return False
+
+    latest_close = float(post_opening.iloc[-1]["close"])
+    latest_high = float(post_opening.iloc[-1]["high"])
+    latest_low = float(post_opening.iloc[-1]["low"])
+
+    if opening["direction"] == "long":
+        return latest_close >= opening["high"] or latest_high > opening["high"]
+    return latest_close <= opening["low"] or latest_low < opening["low"]
+
+
+# -----------------------------
+# SPY filter
+# -----------------------------
+def compute_intraday_vwap(df: pd.DataFrame) -> pd.Series:
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    cum_pv = (typical_price * df["volume"]).cumsum()
+    cum_vol = df["volume"].cumsum().replace(0, np.nan)
+    return cum_pv / cum_vol
+
+
+def get_spy_regime() -> Dict:
+    """
+    Regime logic:
+    - bullish if SPY above VWAP and above opening midpoint
+    - bearish if SPY below VWAP and below opening midpoint
+    - neutral otherwise
+    """
+    try:
+        spy_bars = get_minute_bars(SPY_SYMBOL, 90)
+        spy_bars = filter_today_regular_session(spy_bars)
+        if spy_bars.empty or len(spy_bars) < 10:
+            return {"regime": "neutral", "vwap": None, "last": None}
+
+        spy_bars = spy_bars.copy()
+        spy_bars["vwap"] = compute_intraday_vwap(spy_bars)
+
+        opening = build_opening_5m_candle(spy_bars)
+        if not opening:
+            return {"regime": "neutral", "vwap": None, "last": None}
+
+        last_close = float(spy_bars.iloc[-1]["close"])
+        last_vwap = float(spy_bars.iloc[-1]["vwap"])
+        opening_mid = (opening["high"] + opening["low"]) / 2.0
+
+        if last_close > last_vwap and last_close > opening_mid:
+            regime = "bullish"
+        elif last_close < last_vwap and last_close < opening_mid:
+            regime = "bearish"
+        else:
+            regime = "neutral"
+
+        return {"regime": regime, "vwap": round(last_vwap, 4), "last": round(last_close, 4)}
+    except Exception as e:
+        log(f"SPY regime error: {e}")
+        return {"regime": "neutral", "vwap": None, "last": None}
+
+
+def spy_allows_direction(spy_regime: str, direction: str) -> bool:
+    if spy_regime == "neutral":
+        return False
+    if direction == "long" and spy_regime == "bullish":
+        return True
+    if direction == "short" and spy_regime == "bearish":
+        return True
+    return False
+
+
+# -----------------------------
+# Relative volume / scanner
+# -----------------------------
+def compute_relative_volume(symbol: str, opening_volume: float) -> float:
+    daily = get_daily_bars(symbol, 15)
+    if daily.empty or len(daily) < 6:
+        return 0.0
+    avg_daily_vol = float(daily["volume"].tail(10).mean())
+    avg_opening_5m_proxy = avg_daily_vol / 78.0 if avg_daily_vol > 0 else 0.0
+    if avg_opening_5m_proxy <= 0:
+        return 0.0
+    return opening_volume / avg_opening_5m_proxy
+
+
+# -----------------------------
+# Pattern learning
+# -----------------------------
+def read_trade_log() -> pd.DataFrame:
+    if not os.path.exists(TRADES_LOG_FILE):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(TRADES_LOG_FILE)
+    except Exception:
         return pd.DataFrame()
 
-    return pd.DataFrame(rows).sort_values("prob", ascending=False).head(MAX_CANDIDATES).reset_index(drop=True)
+
+def build_pattern_stats() -> Dict[str, Dict]:
+    df = read_trade_log()
+    if df.empty:
+        return {}
+
+    exits = df[df["event"] == "exit_submitted"].copy()
+    if exits.empty or "pattern_tags" not in exits.columns:
+        return {}
+
+    stats = {}
+    for _, row in exits.iterrows():
+        tags_str = str(row.get("pattern_tags", "")).strip()
+        if not tags_str or tags_str == "nan":
+            continue
+        tags = [t for t in tags_str.split("|") if t]
+        net_pnl = safe_float(row.get("net_pnl"), 0.0)
+        win = 1 if net_pnl > 0 else 0
+
+        for tag in tags:
+            if tag not in stats:
+                stats[tag] = {"count": 0, "wins": 0, "net_pnl_sum": 0.0}
+            stats[tag]["count"] += 1
+            stats[tag]["wins"] += win
+            stats[tag]["net_pnl_sum"] += net_pnl
+
+    return stats
 
 
-# -------------------------
-# Logging snapshots
-# -------------------------
-def log_candidates(cands: pd.DataFrame, threshold: float) -> None:
-    if cands is None or cands.empty:
-        return
-    ts = datetime.utcnow().isoformat()
-    out = cands.copy()
-    out["logged_at"] = ts
-    out["buy_threshold"] = threshold
-    keep = [
-        "logged_at", "symbol", "prob_raw", "prob", "price", "adx_14", "rel_volume_20",
-        "session_vwap_dist", "dist_resistance_20", "zscore_20", "accepted",
-        "accept_reason", "reject_reason", "buy_threshold",
-    ]
-    append_df(CANDIDATE_LOG_FILE, out[keep], max_rows=MAX_CANDIDATE_LOG_ROWS)
+def save_pattern_stats(stats: Dict[str, Dict]) -> None:
+    with open(PATTERN_STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
 
 
-def log_entry(symbol: str, state_row: dict) -> None:
-    row = pd.DataFrame([
-        {
-            "logged_at": datetime.utcnow().isoformat(),
-            "symbol": symbol,
-            "entry_time": state_row.get("entry_time"),
-            "entry_price": state_row.get("entry_price"),
-            "qty": state_row.get("qty"),
-            "entry_score": state_row.get("entry_score"),
-            "entry_reason": state_row.get("entry_reason"),
-        }
-    ])
-    append_df(ENTRY_LOG_FILE, row, max_rows=1000)
+def load_pattern_stats() -> Dict[str, Dict]:
+    if os.path.exists(PATTERN_STATS_FILE):
+        try:
+            with open(PATTERN_STATS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    stats = build_pattern_stats()
+    save_pattern_stats(stats)
+    return stats
 
 
-def log_exit(symbol: str, exit_reason: str, exit_price: float, qty: float, entry_score=None, entry_reason=None) -> None:
-    row = pd.DataFrame([
-        {
-            "logged_at": datetime.utcnow().isoformat(),
-            "symbol": symbol,
-            "exit_price": exit_price,
-            "qty": qty,
-            "exit_reason": exit_reason,
-            "entry_score": entry_score,
-            "entry_reason": entry_reason,
-        }
-    ])
-    append_df(EXIT_LOG_FILE, row, max_rows=1000)
+def adaptive_pattern_score(tags: List[str], stats: Dict[str, Dict]) -> float:
+    """
+    Lightweight learning layer:
+    - Bayesian win-rate smoothing
+    - very small pnl contribution
+    """
+    if not tags:
+        return 0.0
 
-
-def log_account_snapshot() -> None:
-    positions = get_positions_dict()
-    snapshot = pd.DataFrame([
-        {
-            "snapshot_at": datetime.utcnow().isoformat(),
-            "cash": get_cash(),
-            "equity": get_equity(),
-            "positions": len(positions),
-        }
-    ])
-    append_df(ACCOUNT_SNAPSHOT_FILE, snapshot, max_rows=MAX_ACCOUNT_SNAPSHOT_ROWS)
-
-
-# -------------------------
-# Trade management
-# -------------------------
-def submit_market_buy(symbol: str, qty: int) -> bool:
-    if qty <= 0:
-        return False
-    try:
-        cancel_open_orders(symbol)
-        api.submit_order(symbol=symbol, qty=qty, side="buy", type="market", time_in_force="day")
-        log(f"BUY submitted: {symbol} qty={qty}")
-        return True
-    except Exception as e:
-        log(f"BUY failed {symbol}: {e}")
-        return False
-
-
-def submit_market_sell(symbol: str, qty: int) -> bool:
-    if qty <= 0:
-        return False
-    try:
-        cancel_open_orders(symbol)
-        api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
-        log(f"SELL submitted: {symbol} qty={qty}")
-        return True
-    except Exception as e:
-        log(f"SELL failed {symbol}: {e}")
-        return False
-
-
-def calc_sell_net_pnl_pct(entry_price: float, exit_price: float) -> float:
-    gross = (exit_price / entry_price) - 1.0
-    return gross - SEC_FEE_RATE - TRADING_FEE_BUFFER
-
-
-def update_trade_history_record(symbol: str, state_row: dict, exit_price: float, exit_reason: str) -> None:
-    entry_price = safe_float(state_row.get("entry_price"), 0.0)
-    qty = safe_float(state_row.get("qty"), 0.0)
-    highest = safe_float(state_row.get("highest_price"), entry_price)
-    entry_score = state_row.get("entry_score")
-    entry_time = state_row.get("entry_time")
-    entry_reason = state_row.get("entry_reason")
-
-    if entry_price <= 0 or qty <= 0:
-        return
-
-    net_pnl_pct = calc_sell_net_pnl_pct(entry_price, exit_price)
-    gross_pnl = (exit_price - entry_price) * qty
-    sec_fee = exit_price * qty * SEC_FEE_RATE
-    est_other_cost = exit_price * qty * TRADING_FEE_BUFFER
-
-    hold_minutes = None
-    try:
-        et = pd.to_datetime(entry_time, utc=True)
-        hold_minutes = (pd.Timestamp.now(tz="UTC") - et).total_seconds() / 60.0
-    except Exception:
-        pass
-
-    row = pd.DataFrame([
-        {
-            "closed_at": datetime.utcnow().isoformat(),
-            "symbol": symbol,
-            "entry_time": entry_time,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "qty": qty,
-            "highest_price": highest,
-            "entry_score": entry_score,
-            "entry_reason": entry_reason,
-            "gross_pnl": gross_pnl,
-            "sec_fee": sec_fee,
-            "est_other_cost": est_other_cost,
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
-            "exit_reason": exit_reason,
-        }
-    ])
-
-    append_df(TRADE_HISTORY_FILE, row, max_rows=MAX_TRADE_HISTORY_ROWS)
-    log_exit(symbol, exit_reason, exit_price, qty, entry_score=entry_score, entry_reason=entry_reason)
-
-
-def manage_positions(model) -> None:
-    state = sync_open_state_with_broker()
-    positions = get_positions_dict()
-
-    for symbol, pos in positions.items():
-        current_price = safe_float(pos.current_price, safe_float(pos.avg_entry_price, 0.0))
-        entry_price = safe_float(pos.avg_entry_price, 0.0)
-        qty = int(float(pos.qty))
-
-        if entry_price <= 0 or qty <= 0:
+    scores = []
+    for tag in tags:
+        s = stats.get(tag)
+        if not s:
             continue
 
-        s = state.get(symbol, {})
-        s["qty"] = qty
-        s["entry_price"] = entry_price
-        s["highest_price"] = max(safe_float(s.get("highest_price"), entry_price), current_price)
+        count = int(s.get("count", 0))
+        wins = int(s.get("wins", 0))
+        net_pnl_sum = safe_float(s.get("net_pnl_sum", 0.0))
 
-        held_minutes = 0.0
+        smoothed_win_rate = (wins + 2.0) / (count + 4.0)  # pulls toward 50%
+        pnl_per_trade = net_pnl_sum / max(count, 1)
+
+        tag_score = (smoothed_win_rate - 0.5) * 2.0
+        tag_score += clamp(pnl_per_trade / 50.0, -0.25, 0.25)
+
+        # low sample penalty
+        if count < 5:
+            tag_score *= 0.5
+
+        scores.append(tag_score)
+
+    if not scores:
+        return 0.0
+
+    return float(np.mean(scores))
+
+
+def candidate_pattern_tags(
+    opening: Dict,
+    rel_vol: float,
+    spy_regime: str,
+    risk_per_share_pct: float
+) -> List[str]:
+    tags = []
+
+    tags.append(f"dir_{opening['direction']}")
+    tags.append("spy_aligned" if spy_allows_direction(spy_regime, opening["direction"]) else "spy_not_aligned")
+
+    if rel_vol >= 2.0:
+        tags.append("rvol_high")
+    elif rel_vol >= 1.5:
+        tags.append("rvol_good")
+    else:
+        tags.append("rvol_low")
+
+    if opening["body_fraction"] >= 0.60:
+        tags.append("body_strong")
+    else:
+        tags.append("body_medium")
+
+    if opening["direction"] == "long":
+        if opening["close_position"] >= 0.85:
+            tags.append("close_at_high")
+    else:
+        if opening["close_position"] <= 0.15:
+            tags.append("close_at_low")
+
+    if opening["range_pct"] >= 0.01:
+        tags.append("range_expanded")
+    else:
+        tags.append("range_normal")
+
+    if risk_per_share_pct <= 0.015:
+        tags.append("tight_risk")
+    elif risk_per_share_pct <= 0.025:
+        tags.append("normal_risk")
+    else:
+        tags.append("wide_risk")
+
+    return tags
+
+
+# -----------------------------
+# Candidate scoring
+# -----------------------------
+def base_candidate_score(opening: Dict, rel_vol: float, latest_price: float) -> float:
+    score = 0.0
+    score += rel_vol * 4.0
+    score += opening["range_pct"] * 100.0
+    score += opening["body_fraction"] * 2.0
+
+    if opening["direction"] == "long":
+        score += opening["close_position"] * 1.5
+    else:
+        score += (1.0 - opening["close_position"]) * 1.5
+
+    score += latest_price / 1000.0
+    return score
+
+
+# -----------------------------
+# Risk and sizing
+# -----------------------------
+def calculate_qty(entry_price: float, stop_price: float, equity: float, buying_power: float) -> int:
+    risk_per_share = abs(entry_price - stop_price)
+    if risk_per_share <= 0:
+        return 0
+
+    risk_budget = equity * RISK_PER_TRADE_PCT
+    qty_by_risk = int(risk_budget // risk_per_share)
+    qty_by_bp = int((buying_power * 0.95) // entry_price)
+    return max(0, min(qty_by_risk, qty_by_bp))
+
+
+# -----------------------------
+# Order handling / fill reconciliation
+# -----------------------------
+def wait_for_fill_price(order_id: str, retries: int = 8, sleep_seconds: int = 2) -> Tuple[Optional[float], Optional[str]]:
+    for _ in range(retries):
         try:
-            et = pd.to_datetime(s.get("entry_time"), utc=True)
-            held_minutes = (pd.Timestamp.now(tz="UTC") - et).total_seconds() / 60.0
+            order = api.get_order(order_id)
+            status = str(order.status).lower()
+            filled_avg_price = safe_float(getattr(order, "filled_avg_price", None), None)
+
+            if status in {"filled", "partially_filled"} and filled_avg_price is not None:
+                return filled_avg_price, status
+
+            if status in {"canceled", "expired", "rejected"}:
+                return None, status
+
         except Exception:
             pass
 
-        pnl_pct = current_price / entry_price - 1.0
-        trail_stop_hit = False
-        if s["highest_price"] >= entry_price * (1 + TRAIL_ACTIVATE_PCT):
-            trail_floor = s["highest_price"] * (1 - TRAIL_GIVEBACK_PCT)
-            trail_stop_hit = current_price <= trail_floor
+        time.sleep(sleep_seconds)
 
-        exit_reason = None
-        if pnl_pct <= -STOP_LOSS_PCT:
-            exit_reason = "stop_loss"
-        elif pnl_pct >= TAKE_PROFIT_PCT:
-            exit_reason = "take_profit"
-        elif trail_stop_hit:
-            exit_reason = "trailing_stop"
-        elif held_minutes >= MAX_HOLD_MINUTES:
-            exit_reason = "max_hold"
-
-        if exit_reason is None and model is not None:
-            row, _ = latest_feature_row(symbol)
-            if row is not None:
-                X = pd.DataFrame([row[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)])
-                try:
-                    prob = float(model.predict_proba(X)[0][1])
-                    if prob < PROB_SELL_FLOOR:
-                        exit_reason = "score_deterioration"
-                except Exception:
-                    pass
-
-        state[symbol] = s
-
-        if exit_reason and submit_market_sell(symbol, qty):
-            update_trade_history_record(symbol, s, current_price, exit_reason)
-            state.pop(symbol, None)
-
-    save_open_state(state)
+    return None, "timeout"
 
 
-def open_new_positions(model) -> pd.DataFrame:
-    if model is None:
-        log("No model available yet; skipping entries.")
-        return pd.DataFrame()
+def submit_entry_order(symbol: str, qty: int, direction: str) -> Optional[Dict]:
+    side = "buy" if direction == "long" else "sell"
 
-    threshold = adaptive_buy_threshold()
-    positions = get_positions_dict()
-    current_symbols = set(positions.keys())
-    open_slots = max(0, MAX_POSITIONS - len(current_symbols))
-    if open_slots <= 0:
-        log("No open slots available.")
-        return pd.DataFrame()
+    try:
+        order = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type="market",
+            time_in_force="day"
+        )
+        log(f"ENTRY submitted: {symbol} {direction} qty={qty} order_id={order.id}")
 
-    stage1_symbols = build_stage1_universe([s for s in UNIVERSE if s not in current_symbols])
-    if not stage1_symbols:
-        log("Stage 1 scan found no viable symbols.")
-        return pd.DataFrame()
-
-    cands = score_candidates(model, stage1_symbols)
-    log_candidates(cands, threshold)
-
-    if cands.empty:
-        log("No viable candidates after stage 2/3.")
-        return cands
-
-    buys = cands[(cands["prob"] >= threshold) & (cands["accepted"])].head(open_slots).copy()
-    if buys.empty:
-        log(f"No candidates above threshold {threshold:.3f}")
-        return cands
-
-    equity = get_equity()
-    cash = get_cash()
-    usable_cash = max(0.0, cash - equity * CASH_RESERVE)
-    per_position_budget = min(equity * MAX_ALLOC_PER_POSITION, usable_cash / max(len(buys), 1))
-
-    if per_position_budget < MIN_ORDER_NOTIONAL:
-        log("Not enough usable cash for new positions.")
-        return cands
-
-    state = load_open_state()
-    for _, row in buys.iterrows():
-        price = safe_float(row["price"], 0.0)
-        if price <= 0:
-            continue
-        qty = int(per_position_budget // price)
-        notional = qty * price
-        if qty <= 0 or notional < MIN_ORDER_NOTIONAL:
-            continue
-
-        if submit_market_buy(row["symbol"], qty):
-            state[row["symbol"]] = {
-                "entry_time": datetime.utcnow().isoformat(),
-                "entry_price": price,
-                "qty": qty,
-                "highest_price": price,
-                "entry_score": float(row["prob"]),
-                "entry_reason": row["accept_reason"] if row["accept_reason"] else "passed score + vetting",
-            }
-            log_entry(row["symbol"], state[row["symbol"]])
-
-    save_open_state(state)
-    return cands
+        fill_price, fill_status = wait_for_fill_price(order.id)
+        return {
+            "order_id": order.id,
+            "fill_price": fill_price,
+            "fill_status": fill_status
+        }
+    except Exception as e:
+        log(f"Entry order failed for {symbol}: {e}")
+        return None
 
 
-# -------------------------
-# Dashboard generation
-# -------------------------
-def load_recent_logs(max_lines=120):
-    if not RUN_LOG_FILE.exists():
+def submit_exit_order(symbol: str, qty: int, position_side: str) -> Optional[Dict]:
+    exit_side = "sell" if position_side == "long" else "buy"
+
+    try:
+        order = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=exit_side,
+            type="market",
+            time_in_force="day"
+        )
+        log(f"EXIT submitted: {symbol} {position_side} qty={qty} order_id={order.id}")
+
+        fill_price, fill_status = wait_for_fill_price(order.id)
+        return {
+            "order_id": order.id,
+            "fill_price": fill_price,
+            "fill_status": fill_status
+        }
+    except Exception as e:
+        log(f"Exit order failed for {symbol}: {e}")
+        return None
+
+
+# -----------------------------
+# Fees / pnl
+# -----------------------------
+def estimate_sec_fee(exit_side: str, exit_price: float, qty: int) -> float:
+    if exit_side.lower() != "sell":
+        return 0.0
+    return round(exit_price * qty * SEC_FEE_RATE, 6)
+
+
+def compute_trade_pnl(direction: str, entry_fill: float, exit_fill: float, qty: int) -> Dict[str, float]:
+    gross = (exit_fill - entry_fill) * qty if direction == "long" else (entry_fill - exit_fill) * qty
+    exit_side = "sell" if direction == "long" else "buy"
+    sec_fee = estimate_sec_fee(exit_side, exit_fill, qty)
+    net = gross - sec_fee
+    return {
+        "gross_pnl": round(gross, 4),
+        "sec_fee": round(sec_fee, 6),
+        "net_pnl": round(net, 4)
+    }
+
+
+# -----------------------------
+# Kill switch
+# -----------------------------
+def update_kill_switch(state: Dict) -> Dict:
+    daily_start_equity = safe_float(state.get("daily_start_equity"), 0.0)
+    realized_net_pnl_today = safe_float(state.get("realized_net_pnl_today"), 0.0)
+    losing_trades_today = int(state.get("losing_trades_today", 0))
+
+    if daily_start_equity > 0:
+        daily_loss_pct = max(0.0, -realized_net_pnl_today / daily_start_equity)
+        if daily_loss_pct >= MAX_DAILY_NET_LOSS_PCT:
+            state["kill_switch"] = True
+            state["kill_switch_reason"] = f"daily_net_loss_limit_{MAX_DAILY_NET_LOSS_PCT:.2%}"
+            return state
+
+    if losing_trades_today >= MAX_DAILY_LOSING_TRADES:
+        state["kill_switch"] = True
+        state["kill_switch_reason"] = f"max_losing_trades_{MAX_DAILY_LOSING_TRADES}"
+        return state
+
+    return state
+
+
+# -----------------------------
+# Scanner
+# -----------------------------
+def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
+    spy = get_spy_regime()
+    spy_regime = spy["regime"]
+    if spy_regime == "neutral":
+        log("SPY regime neutral. No new trades.")
         return []
-    with open(RUN_LOG_FILE, "r", encoding="utf-8") as f:
-        lines = [x.rstrip("\n") for x in f.readlines()]
-    return lines[-max_lines:]
 
+    equity = get_account_equity()
+    buying_power = get_buying_power()
+    candidates = []
 
-def save_simple_equity_chart():
-    if not ACCOUNT_SNAPSHOT_FILE.exists():
-        return None
-    df = pd.read_csv(ACCOUNT_SNAPSHOT_FILE)
-    if df.empty or "equity" not in df.columns:
-        return None
+    for symbol in DEFAULT_UNIVERSE[:SCANNER_LIMIT]:
+        if symbol == SPY_SYMBOL:
+            continue
 
-    x = pd.to_datetime(df["snapshot_at"], errors="coerce")
-    y = pd.to_numeric(df["equity"], errors="coerce")
-    fig = plt.figure(figsize=(9, 4))
-    ax = fig.add_subplot(111)
-    ax.plot(x, y)
-    ax.set_title("Equity Curve")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Equity")
-    fig.autofmt_xdate()
-    path = CHARTS_DIR / "equity_curve.png"
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
-    return path.name
-
-
-def draw_candlestick_panel(ax, bars: pd.DataFrame):
-    if bars.empty:
-        return
-    bars = bars.reset_index(drop=True).copy()
-    width = 0.55
-    for i, row in bars.iterrows():
-        o = safe_float(row["open"])
-        h = safe_float(row["high"])
-        l = safe_float(row["low"])
-        c = safe_float(row["close"])
-        ax.vlines(i, l, h, linewidth=1)
-        lower = min(o, c)
-        height = max(abs(c - o), 1e-6)
-        rect = Rectangle((i - width / 2, lower), width, height, fill=False, linewidth=1)
-        ax.add_patch(rect)
-    if "ema_8" in bars.columns:
-        ax.plot(np.arange(len(bars)), bars["ema_8"].values, linewidth=1, label="EMA8")
-    if "ema_21" in bars.columns:
-        ax.plot(np.arange(len(bars)), bars["ema_21"].values, linewidth=1, label="EMA21")
-    if "session_vwap" in bars.columns:
-        ax.plot(np.arange(len(bars)), bars["session_vwap"].values, linewidth=1, linestyle="--", label="VWAP")
-    ax.legend(loc="upper left", fontsize=7)
-    ax.set_xlim(-1, len(bars))
-
-
-def save_trade_chart(symbol: str, entry_price=None, exit_price=None):
-    bars = get_bars(symbol, DASHBOARD_BARS)
-    if bars.empty or len(bars) < 40:
-        return None
-
-    feats = build_features(bars)
-    if feats.empty:
-        return None
-    feats = feats.tail(DASHBOARD_BARS).copy().reset_index(drop=True)
-
-    threshold = adaptive_buy_threshold()
-    model = load_model()
-    if model is not None:
-        feat_input = feats[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)
         try:
-            prob_series = model.predict_proba(feat_input)[:, 1]
-        except Exception:
-            prob_series = np.full(len(feats), np.nan)
-    else:
-        prob_series = np.full(len(feats), np.nan)
+            minute_bars = get_minute_bars(symbol, 90)
+            if minute_bars.empty:
+                continue
 
-    fig = plt.figure(figsize=(10, 7))
-    gs = fig.add_gridspec(3, 1, height_ratios=[3, 1.2, 1.2])
-    ax1 = fig.add_subplot(gs[0])
-    ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    ax3 = fig.add_subplot(gs[2], sharex=ax1)
+            opening = build_opening_5m_candle(minute_bars)
+            if not opening:
+                continue
 
-    draw_candlestick_panel(ax1, feats)
-    ax1.set_title(f"{symbol} | Candles + Signals")
-    x = np.arange(len(feats))
+            if not opening_candle_is_valid(opening):
+                continue
 
-    if entry_price is not None:
-        ax1.axhline(entry_price, linestyle="--", linewidth=1)
-    if exit_price is not None:
-        ax1.axhline(exit_price, linestyle=":", linewidth=1)
+            latest_price = get_latest_trade_price(symbol)
+            if latest_price is None:
+                continue
 
-    for idx, r in feats.tail(20).iterrows():
-        notes = []
-        if int(safe_float(r.get("cdl_bull_engulf"))) == 1:
-            notes.append("Engulf")
-        if int(safe_float(r.get("cdl_hammer"))) == 1:
-            notes.append("Hammer")
-        if int(safe_float(r.get("breakout_20_up"))) == 1:
-            notes.append("Breakout")
-        if notes:
-            ax1.annotate(",".join(notes), (idx, safe_float(r["high"])), fontsize=6)
+            if latest_price < MIN_PRICE or latest_price > MAX_PRICE:
+                continue
 
-    ax2.plot(x, prob_series, linewidth=1)
-    ax2.axhline(threshold, linestyle="--", linewidth=1)
-    ax2.axhline(PROB_SELL_FLOOR, linestyle=":", linewidth=1)
-    ax2.set_ylabel("Prob")
+            if not spy_allows_direction(spy_regime, opening["direction"]):
+                continue
 
-    ax3.plot(x, feats["rel_volume_20"].values, linewidth=1, label="RelVol20")
-    ax3.plot(x, (feats["adx_14"] / 25.0).values, linewidth=1, label="ADX/25")
-    ax3.plot(x, (feats["session_vwap_dist"].fillna(0).values * 50.0), linewidth=1, label="VWAPdist*50")
-    ax3.legend(fontsize=7, loc="upper left")
-    ax3.set_ylabel("Signals")
-    ax3.set_xlabel("Bars")
+            rel_vol = compute_relative_volume(symbol, opening["volume"])
+            if rel_vol < MIN_RELATIVE_VOLUME:
+                continue
 
-    path = CHARTS_DIR / f"{symbol}_decision.png"
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
-    return path.name
+            dollar_volume = latest_price * opening["volume"]
+            if dollar_volume < MIN_DOLLAR_VOLUME:
+                continue
+
+            levels = build_image_style_trade_levels(opening, latest_price)
+            if levels["risk_per_share_pct"] > MAX_RISK_PER_SHARE_PCT:
+                continue
+
+            if not breakout_is_confirmed(symbol, opening, minute_bars):
+                continue
+
+            qty = calculate_qty(levels["entry_price"], levels["stop_price"], equity, buying_power)
+            if qty < 1:
+                continue
+
+            pattern_tags = candidate_pattern_tags(
+                opening=opening,
+                rel_vol=rel_vol,
+                spy_regime=spy_regime,
+                risk_per_share_pct=levels["risk_per_share_pct"]
+            )
+            adaptive_score = adaptive_pattern_score(pattern_tags, pattern_stats)
+            if adaptive_score < MIN_ADAPTIVE_SCORE:
+                continue
+
+            base_score = base_candidate_score(opening, rel_vol, latest_price)
+            score = base_score + adaptive_score
+
+            candidates.append({
+                "symbol": symbol,
+                "latest_price": latest_price,
+                "opening": opening,
+                "direction": opening["direction"],
+                "entry_price": levels["entry_price"],
+                "stop_price": levels["stop_price"],
+                "target_price": levels["target_price"],
+                "risk_per_share": levels["risk_per_share"],
+                "risk_per_share_pct": levels["risk_per_share_pct"],
+                "qty": qty,
+                "relative_volume": rel_vol,
+                "dollar_volume": dollar_volume,
+                "spy_regime": spy_regime,
+                "pattern_tags": pattern_tags,
+                "adaptive_score": adaptive_score,
+                "base_score": base_score,
+                "score": score
+            })
+
+        except Exception as e:
+            log(f"Scanner skip {symbol}: {e}")
+
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return candidates
 
 
-def html_table(df: pd.DataFrame) -> str:
-    if df is None or df.empty:
-        return "<p>No data.</p>"
-    show = df.copy()
-    for c in show.columns:
-        if pd.api.types.is_float_dtype(show[c]):
-            show[c] = show[c].map(lambda v: f"{v:.4f}")
-    return show.to_html(index=False, classes="tbl", border=0)
+# -----------------------------
+# Entry management
+# -----------------------------
+def maybe_enter_new_positions(state: Dict, pattern_stats: Dict[str, Dict]) -> Dict:
+    current = now_et()
+
+    if not is_entry_window(current):
+        log("Outside entry window for new trades.")
+        return state
+
+    state = update_kill_switch(state)
+    if state.get("kill_switch"):
+        log(f"Kill switch active. Reason: {state.get('kill_switch_reason')}")
+        return state
+
+    live_positions = get_current_positions()
+
+    if len(live_positions) >= MAX_OPEN_POSITIONS:
+        log("Max open positions reached.")
+        return state
+
+    if int(state.get("trades_today", 0)) >= MAX_TRADES_PER_DAY:
+        log("Max trades reached for today.")
+        return state
+
+    candidates = scan_candidates(pattern_stats)
+    state["last_scan_candidates"] = [c["symbol"] for c in candidates[:15]]
+    save_state(state)
+
+    if not candidates:
+        log("No candidates found.")
+        return state
+
+    for c in candidates:
+        if int(state.get("trades_today", 0)) >= MAX_TRADES_PER_DAY:
+            break
+        if len(get_current_positions()) >= MAX_OPEN_POSITIONS:
+            break
+
+        symbol = c["symbol"]
+        if symbol in live_positions:
+            continue
+        if symbol in state["symbols_traded_today"]:
+            continue
+
+        opening = c["opening"]
+        pattern_tags_str = "|".join(c["pattern_tags"])
+
+        append_csv(SIGNALS_LOG_FILE, {
+            "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "direction": c["direction"],
+            "latest_price": round(c["latest_price"], 4),
+            "opening_open": round(opening["open"], 4),
+            "opening_high": round(opening["high"], 4),
+            "opening_low": round(opening["low"], 4),
+            "opening_close": round(opening["close"], 4),
+            "opening_volume": int(opening["volume"]),
+            "relative_volume": round(c["relative_volume"], 4),
+            "range_pct": round(opening["range_pct"], 4),
+            "body_fraction": round(opening["body_fraction"], 4),
+            "close_position": round(opening["close_position"], 4),
+            "adaptive_score": round(c["adaptive_score"], 4),
+            "base_score": round(c["base_score"], 4),
+            "score": round(c["score"], 4),
+            "spy_regime": c["spy_regime"],
+            "pattern_tags": pattern_tags_str,
+            "action": "entry_candidate"
+        }, SIGNAL_COLUMNS)
+
+        order_result = submit_entry_order(symbol, c["qty"], c["direction"])
+        if not order_result:
+            continue
+
+        entry_fill = order_result["fill_price"] if order_result["fill_price"] is not None else c["entry_price"]
+
+        state["trades_today"] += 1
+        state["symbols_traded_today"].append(symbol)
+        state["positions"][symbol] = {
+            "symbol": symbol,
+            "direction": c["direction"],
+            "qty": c["qty"],
+            "entry_order_id": order_result["order_id"],
+            "entry_price_est": c["entry_price"],
+            "entry_price_fill": round(entry_fill, 4),
+            "stop_price": c["stop_price"],
+            "target_price": c["target_price"],
+            "score": round(c["score"], 4),
+            "relative_volume": round(c["relative_volume"], 4),
+            "range_pct": round(opening["range_pct"], 4),
+            "spy_regime": c["spy_regime"],
+            "pattern_tags": pattern_tags_str,
+            "status": "open",
+            "entered_at_et": current.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        append_csv(TRADES_LOG_FILE, {
+            "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "direction": c["direction"],
+            "event": "entry_submitted",
+            "qty": c["qty"],
+            "entry_order_id": order_result["order_id"],
+            "entry_price_est": c["entry_price"],
+            "entry_price_fill": round(entry_fill, 4),
+            "stop_price": c["stop_price"],
+            "target_price": c["target_price"],
+            "exit_order_id": "",
+            "exit_price_est": "",
+            "exit_price_fill": "",
+            "reason": "image_signal_opening_range_breakout",
+            "gross_pnl": "",
+            "sec_fee": "",
+            "net_pnl": "",
+            "score": round(c["score"], 4),
+            "relative_volume": round(c["relative_volume"], 4),
+            "range_pct": round(opening["range_pct"], 4),
+            "spy_regime": c["spy_regime"],
+            "pattern_tags": pattern_tags_str
+        }, TRADE_COLUMNS)
+
+        save_state(state)
+
+    return state
 
 
-def render_dashboard(last_candidates: pd.DataFrame):
-    positions = get_positions_dict()
-    open_state = load_open_state()
-    trade_hist = load_trade_history().tail(20) if TRADE_HISTORY_FILE.exists() else pd.DataFrame()
-    candidate_log = pd.read_csv(CANDIDATE_LOG_FILE).tail(20) if CANDIDATE_LOG_FILE.exists() else pd.DataFrame()
-    entry_log = pd.read_csv(ENTRY_LOG_FILE).tail(10) if ENTRY_LOG_FILE.exists() else pd.DataFrame()
-    logs = load_recent_logs()
-    model_meta = load_model_meta()
+# -----------------------------
+# Exit management
+# -----------------------------
+def maybe_manage_and_exit_positions(state: Dict) -> Dict:
+    current = now_et()
+    live_positions = get_current_positions()
 
-    open_rows = []
-    chart_files = []
-    for sym, pos in positions.items():
-        entry = safe_float(pos.avg_entry_price, 0.0)
-        current = safe_float(pos.current_price, entry)
-        qty = safe_float(pos.qty, 0.0)
-        pnl_pct = (current / entry - 1.0) if entry > 0 else 0.0
-        state = open_state.get(sym, {})
-        open_rows.append({
-            "symbol": sym,
+    if not live_positions:
+        log("No live positions to manage.")
+        return state
+
+    for symbol, live_pos in live_positions.items():
+        tracked = state["positions"].get(symbol)
+        if not tracked or tracked.get("status") not in {"open", "exit_rejected"}:
+            continue
+
+        direction = tracked["direction"]
+        qty = int(live_pos["qty"])
+        current_price = safe_float(live_pos["current_price"], None)
+        if current_price is None:
+            continue
+
+        stop_price = safe_float(tracked["stop_price"])
+        target_price = safe_float(tracked["target_price"])
+        entry_fill = safe_float(tracked.get("entry_price_fill"), safe_float(tracked.get("entry_price_est")))
+
+        reason = None
+
+        if direction == "long":
+            if current_price <= stop_price:
+                reason = "stop_hit"
+            elif current_price >= target_price:
+                reason = "target_hit"
+        else:
+            if current_price >= stop_price:
+                reason = "stop_hit"
+            elif current_price <= target_price:
+                reason = "target_hit"
+
+        if is_force_exit_time(current):
+            reason = "time_exit_1015"
+
+        if not reason:
+            continue
+
+        exit_result = submit_exit_order(symbol, qty, direction)
+        if not exit_result:
+            tracked["status"] = "exit_rejected"
+            state["positions"][symbol] = tracked
+            save_state(state)
+            continue
+
+        exit_fill = exit_result["fill_price"] if exit_result["fill_price"] is not None else current_price
+        pnl = compute_trade_pnl(direction, entry_fill, exit_fill, qty)
+
+        append_csv(TRADES_LOG_FILE, {
+            "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "direction": direction,
+            "event": "exit_submitted",
             "qty": qty,
-            "entry_price": entry,
-            "current_price": current,
-            "pnl_pct": pnl_pct,
-            "entry_score": state.get("entry_score"),
-            "entry_reason": state.get("entry_reason", ""),
-        })
-        cf = save_trade_chart(sym, entry_price=entry)
-        if cf:
-            chart_files.append((sym, cf, state.get("entry_reason", "")))
+            "entry_order_id": tracked.get("entry_order_id", ""),
+            "entry_price_est": tracked.get("entry_price_est", ""),
+            "entry_price_fill": round(entry_fill, 4),
+            "stop_price": round(stop_price, 4),
+            "target_price": round(target_price, 4),
+            "exit_order_id": exit_result["order_id"],
+            "exit_price_est": round(current_price, 4),
+            "exit_price_fill": round(exit_fill, 4),
+            "reason": reason,
+            "gross_pnl": pnl["gross_pnl"],
+            "sec_fee": pnl["sec_fee"],
+            "net_pnl": pnl["net_pnl"],
+            "score": safe_float(tracked.get("score"), 0.0),
+            "relative_volume": safe_float(tracked.get("relative_volume"), 0.0),
+            "range_pct": safe_float(tracked.get("range_pct"), 0.0),
+            "spy_regime": tracked.get("spy_regime", ""),
+            "pattern_tags": tracked.get("pattern_tags", "")
+        }, TRADE_COLUMNS)
 
-    if last_candidates is not None and not last_candidates.empty:
-        for sym in last_candidates.head(4)["symbol"].tolist():
-            if sym not in [x[0] for x in chart_files]:
-                cf = save_trade_chart(sym)
-                if cf:
-                    sub = last_candidates[last_candidates["symbol"] == sym].iloc[0]
-                    note = sub.get("accept_reason", "") or sub.get("reject_reason", "")
-                    chart_files.append((sym, cf, note))
-
-    open_df = pd.DataFrame(open_rows)
-    equity_chart = save_simple_equity_chart()
-
-    cards_html = f"""
-    <div class=\"cards\">
-      <div class=\"card\"><div class=\"label\">Last Run</div><div class=\"value\">{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</div></div>
-      <div class=\"card\"><div class=\"label\">Equity</div><div class=\"value\">{get_equity():.2f}</div></div>
-      <div class=\"card\"><div class=\"label\">Cash</div><div class=\"value\">{get_cash():.2f}</div></div>
-      <div class=\"card\"><div class=\"label\">Open Positions</div><div class=\"value\">{len(positions)}</div></div>
-      <div class=\"card\"><div class=\"label\">Universe Size</div><div class=\"value\">{len(UNIVERSE)}</div></div>
-      <div class=\"card\"><div class=\"label\">Model Rows</div><div class=\"value\">{model_meta.get('train_rows', 0)}</div></div>
-    </div>
-    """
-
-    chart_html_parts = []
-    if equity_chart:
-        chart_html_parts.append(
-            f'<div class="panel"><h2>Equity Curve</h2><img class="wide" src="charts/{equity_chart}" alt="equity curve"></div>'
+        state["realized_net_pnl_today"] = round(
+            safe_float(state.get("realized_net_pnl_today"), 0.0) + pnl["net_pnl"],
+            4
         )
+        if pnl["net_pnl"] < 0:
+            state["losing_trades_today"] = int(state.get("losing_trades_today", 0)) + 1
 
-    for sym, cf, note in chart_files[:8]:
-        chart_html_parts.append(
-            f'<div class="panel"><h2>{sym} Decision Chart</h2><p class="muted">{note}</p><img class="wide" src="charts/{cf}" alt="{sym} decision chart"></div>'
+        tracked["status"] = "closed"
+        tracked["exit_order_id"] = exit_result["order_id"]
+        tracked["exit_price_fill"] = round(exit_fill, 4)
+        tracked["exit_reason"] = reason
+        tracked["closed_at_et"] = current.strftime("%Y-%m-%d %H:%M:%S")
+        tracked["gross_pnl"] = pnl["gross_pnl"]
+        tracked["sec_fee"] = pnl["sec_fee"]
+        tracked["net_pnl"] = pnl["net_pnl"]
+        state["positions"][symbol] = tracked
+
+        state = update_kill_switch(state)
+        save_state(state)
+
+    return state
+
+
+# -----------------------------
+# Pattern stats refresh
+# -----------------------------
+def refresh_pattern_stats() -> Dict[str, Dict]:
+    stats = build_pattern_stats()
+    save_pattern_stats(stats)
+    return stats
+
+
+# -----------------------------
+# Main runner
+# -----------------------------
+def run_bot() -> None:
+    log("=== bot_phase95.py start ===")
+    ensure_dirs()
+
+    state = load_state()
+    state = reset_daily_state_if_needed(state)
+    pattern_stats = load_pattern_stats()
+
+    try:
+        if not market_is_open():
+            log("Market is closed. Exiting cleanly.")
+            return
+
+        current = now_et()
+        log(f"Current ET time: {current.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+        # First manage open positions.
+        state = maybe_manage_and_exit_positions(state)
+
+        # Refresh learning stats after exits.
+        pattern_stats = refresh_pattern_stats()
+
+        # Then evaluate new entries.
+        if is_entry_window(current):
+            state = maybe_enter_new_positions(state, pattern_stats)
+        else:
+            log("Outside entry window for new entries.")
+
+        save_state(state)
+        log(
+            f"Done. trades_today={state.get('trades_today', 0)} "
+            f"losing_trades_today={state.get('losing_trades_today', 0)} "
+            f"realized_net_pnl_today={state.get('realized_net_pnl_today', 0.0)} "
+            f"kill_switch={state.get('kill_switch', False)}"
         )
+        log("=== bot_phase95.py complete ===")
 
-    html = f"""<!doctype html>
-<html>
-<head>
-<meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-<title>Phase 9.5 Trading Dashboard</title>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 16px; background:#f7f7f7; color:#111; }}
-h1,h2 {{ margin: 0 0 10px 0; }}
-.panel {{ background:white; padding:14px; margin:14px 0; border-radius:14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow-x:auto; }}
-.cards {{ display:grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap:10px; }}
-.card {{ background:white; padding:12px; border-radius:14px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-.label {{ font-size:12px; color:#666; }}
-.value {{ font-size:20px; margin-top:4px; }}
-.tbl {{ width:100%; border-collapse: collapse; font-size: 13px; }}
-.tbl th, .tbl td {{ padding: 8px; border-bottom:1px solid #ddd; text-align:left; }}
-.wide {{ width:100%; height:auto; border-radius:8px; }}
-.muted {{ color:#666; font-size:13px; }}
-pre {{ white-space: pre-wrap; word-wrap: break-word; font-size:12px; }}
-</style>
-</head>
-<body>
-<h1>Phase 9.5 Trading Dashboard</h1>
-<p class=\"muted\">Mobile-friendly HTML dashboard generated by the bot. Open this file on laptop or Android.</p>
-{cards_html}
-{''.join(chart_html_parts)}
-<div class=\"panel\"><h2>Open Positions</h2>{html_table(open_df)}</div>
-<div class=\"panel\"><h2>Top Recent Candidates</h2>{html_table(last_candidates.head(12) if last_candidates is not None and not last_candidates.empty else pd.DataFrame())}</div>
-<div class=\"panel\"><h2>Recent Candidate Log</h2>{html_table(candidate_log)}</div>
-<div class=\"panel\"><h2>Recent Entries</h2>{html_table(entry_log)}</div>
-<div class=\"panel\"><h2>Recent Closed Trades</h2>{html_table(trade_hist)}</div>
-<div class=\"panel\"><h2>Recent Run Logs</h2><pre>{chr(10).join(logs)}</pre></div>
-</body>
-</html>"""
-
-    with open(DASHBOARD_DIR / "dashboard.html", "w", encoding="utf-8") as f:
-        f.write(html)
+    except Exception as e:
+        log(f"Fatal error: {e}")
+        traceback.print_exc()
+        save_state(state)
+        raise
 
 
-# -------------------------
-# Main
-# -------------------------
-def run_bot():
-    log("=== Phase 9.5 bot start ===")
-    log_account_snapshot()
-
-    if not market_is_open():
-        log("Market is closed. Rendering dashboard and exiting cleanly.")
-        render_dashboard(pd.DataFrame())
-        return
-
-    sync_open_state_with_broker()
-
-    stage1_for_training = build_stage1_universe(UNIVERSE)
-    training_symbols = stage1_for_training if stage1_for_training else UNIVERSE[:24]
-    new_rows = update_training_store(training_symbols)
-    meta = load_model_meta()
-    meta["new_rows_since_train"] = int(meta.get("new_rows_since_train", 0)) + int(new_rows)
-    save_json(MODEL_META_FILE, meta)
-    log(f"Training store updated with ~{new_rows} rows using {len(training_symbols)} symbols")
-
-    model, _ = train_or_load_model(force=False)
-
-    manage_positions(model)
-    cands = open_new_positions(model)
-
-    rolling_trim_csv(TRAIN_DATA_FILE, MAX_TRAIN_ROWS)
-    rolling_trim_csv(TRADE_HISTORY_FILE, MAX_TRADE_HISTORY_ROWS)
-    rolling_trim_csv(CANDIDATE_LOG_FILE, MAX_CANDIDATE_LOG_ROWS)
-    rolling_trim_csv(ENTRY_LOG_FILE, 1000)
-    rolling_trim_csv(EXIT_LOG_FILE, 1000)
-    rolling_trim_csv(ACCOUNT_SNAPSHOT_FILE, MAX_ACCOUNT_SNAPSHOT_ROWS)
-
-    render_dashboard(cands)
-    save_json(
-        LAST_RUN_FILE,
-        {
-            "completed_at": datetime.utcnow().isoformat(),
-            "candidate_count": 0 if cands is None else int(len(cands)),
-            "open_positions": int(len(get_positions_dict())),
-        },
-    )
-
-    log("=== Phase 9.5 bot end ===")
-
+if __name__ == "__main__":
+    run_bot()
 
 if __name__ == "__main__":
     run_bot()
