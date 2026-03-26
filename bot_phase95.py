@@ -44,8 +44,9 @@ api = tradeapi.REST(
 # -----------------------------
 # Time zones
 # -----------------------------
-EASTERN = pytz.timezone("US/Eastern")
+EASTERN = pytz.timezone("America/New_York")
 UTC = pytz.UTC
+PACIFIC = pytz.timezone("America/Los_Angeles")
 
 
 # -----------------------------
@@ -127,12 +128,18 @@ def ensure_dirs() -> None:
 
 
 def now_et() -> datetime:
-    return datetime.now(UTC).astimezone(EASTERN)
+    # Force New York exchange time directly rather than converting from server time.
+    return datetime.now(EASTERN)
+
+
+def now_pacific() -> datetime:
+    return datetime.now(PACIFIC)
 
 
 def log(msg: str) -> None:
-    stamp = now_et().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] {msg}")
+    et = now_et().strftime("%Y-%m-%d %H:%M:%S")
+    pt = now_pacific().strftime("%H:%M:%S")
+    print(f"[ET {et} | PT {pt}] {msg}")
 
 
 def safe_float(x, default=0.0) -> float:
@@ -1157,7 +1164,10 @@ def run_bot() -> None:
             return
 
         current = now_et()
-        log(f"Current ET time: {current.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        log(
+            f"Current ET time: {current.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"| PT {now_pacific().strftime('%H:%M:%S %Z')}"
+        )
 
         state = maybe_manage_and_exit_positions(state)
 
