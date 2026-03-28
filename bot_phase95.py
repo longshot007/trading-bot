@@ -18,8 +18,9 @@ import alpaca_trade_api as tradeapi
 # - Softer SPY filter
 # - Actual fill reconciliation
 # - Lightweight profitability learning from logged pattern tags
-# - Entries allowed through 11:00 ET
-# - Forced flat at 11:00 ET
+# - Active for the first half of the regular trading day
+#   * Entries allowed from 09:35 ET through 12:45 ET
+#   * Forced flat at 12:45 ET
 # ============================================================
 
 
@@ -86,13 +87,16 @@ NEAR_BREAKOUT_PCT = 0.0015
 
 TARGET_R_MULTIPLE = 2.0
 
+# First half of regular market session:
+# 09:30 ET to 16:00 ET is 6.5 hours total, midpoint is 12:45 ET.
+# Keep the 09:35 start so the first 5-minute opening candle is complete.
 ENTRY_START_HOUR = 9
 ENTRY_START_MINUTE = 35
-ENTRY_END_HOUR = 11
-ENTRY_END_MINUTE = 0
+ENTRY_END_HOUR = 12
+ENTRY_END_MINUTE = 45
 
-FORCE_EXIT_HOUR = 11
-FORCE_EXIT_MINUTE = 0
+FORCE_EXIT_HOUR = 12
+FORCE_EXIT_MINUTE = 45
 
 SPY_SYMBOL = "SPY"
 SCANNER_LIMIT = 200
@@ -128,7 +132,6 @@ def ensure_dirs() -> None:
 
 
 def now_et() -> datetime:
-    # Force New York exchange time directly rather than converting from server time.
     return datetime.now(EASTERN)
 
 
@@ -295,7 +298,7 @@ def is_force_exit_time(current_et: datetime) -> bool:
 # -----------------------------
 # Data retrieval
 # -----------------------------
-def get_minute_bars(symbol: str, minutes_back: int = 120) -> pd.DataFrame:
+def get_minute_bars(symbol: str, minutes_back: int = 240) -> pd.DataFrame:
     end_utc = datetime.now(UTC)
     start_utc = end_utc - timedelta(minutes=minutes_back + 30)
 
@@ -458,10 +461,9 @@ def build_trade_levels(opening: Dict, latest_price: float) -> Dict:
 
 
 def breakout_is_confirmed(opening: Dict, latest_price: float, levels: Dict) -> bool:
-    if opening["direction"] == "long":
-        trigger = levels["entry_price"]
-        return latest_price >= trigger or latest_price >= trigger * (1 - NEAR_BREAKOUT_PCT)
     trigger = levels["entry_price"]
+    if opening["direction"] == "long":
+        return latest_price >= trigger or latest_price >= trigger * (1 - NEAR_BREAKOUT_PCT)
     return latest_price <= trigger or latest_price <= trigger * (1 + NEAR_BREAKOUT_PCT)
 
 
@@ -477,7 +479,7 @@ def compute_intraday_vwap(df: pd.DataFrame) -> pd.Series:
 
 def get_spy_regime() -> Dict:
     try:
-        spy_bars = get_minute_bars(SPY_SYMBOL, 120)
+        spy_bars = get_minute_bars(SPY_SYMBOL, 240)
         spy_bars = filter_today_regular_session(spy_bars)
         if spy_bars.empty or len(spy_bars) < 10:
             return {"regime": "neutral", "last": None, "vwap": None}
@@ -834,7 +836,7 @@ def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
             continue
 
         try:
-            minute_bars = get_minute_bars(symbol, 120)
+            minute_bars = get_minute_bars(symbol, 240)
             if minute_bars.empty:
                 continue
 
@@ -923,124 +925,130 @@ def maybe_enter_new_positions(state: Dict, pattern_stats: Dict[str, Dict]) -> Di
 
     state = update_kill_switch(state)
     if state.get("kill_switch"):
-        log(f"Kill switch active. Reason: {state.get('kill_switch_reason')}")
+        log(f"Kill switch active: {state.get('kill_switch_reason', '')}")
         return state
 
-    live_positions = get_current_positions()
-
-    if len(live_positions) >= MAX_OPEN_POSITIONS:
-        log("Max open positions reached.")
+    open_positions = get_current_positions()
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
+        log(f"Max open positions reached: {len(open_positions)}/{MAX_OPEN_POSITIONS}")
         return state
 
     if int(state.get("trades_today", 0)) >= MAX_TRADES_PER_DAY:
-        log("Max trades reached for today.")
+        log(f"Max trades reached: {state.get('trades_today', 0)}/{MAX_TRADES_PER_DAY}")
         return state
 
     candidates = scan_candidates(pattern_stats)
-    state["last_scan_candidates"] = [c["symbol"] for c in candidates[:15]]
-    save_state(state)
+    state["last_scan_candidates"] = [c["symbol"] for c in candidates[:10]]
 
     if not candidates:
-        log("No candidates found.")
+        log("No valid candidates found.")
+        save_state(state)
         return state
 
-    for c in candidates:
-        if int(state.get("trades_today", 0)) >= MAX_TRADES_PER_DAY:
-            break
-        if len(get_current_positions()) >= MAX_OPEN_POSITIONS:
+    traded_today = set(state.get("symbols_traded_today", []))
+    currently_held = set(open_positions.keys())
+
+    slots_left = min(
+        MAX_OPEN_POSITIONS - len(currently_held),
+        MAX_TRADES_PER_DAY - int(state.get("trades_today", 0))
+    )
+
+    for candidate in candidates:
+        if slots_left <= 0:
             break
 
-        symbol = c["symbol"]
-        if symbol in live_positions:
+        symbol = candidate["symbol"]
+        if symbol in traded_today:
             continue
-        if symbol in state["symbols_traded_today"]:
+        if symbol in currently_held:
             continue
-
-        opening = c["opening"]
-        pattern_tags_str = "|".join(c["pattern_tags"])
 
         append_csv(SIGNALS_LOG_FILE, {
             "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
-            "direction": c["direction"],
-            "latest_price": round(c["latest_price"], 4),
-            "opening_open": round(opening["open"], 4),
-            "opening_high": round(opening["high"], 4),
-            "opening_low": round(opening["low"], 4),
-            "opening_close": round(opening["close"], 4),
-            "opening_volume": int(opening["volume"]),
-            "relative_volume": round(c["relative_volume"], 4),
-            "range_pct": round(opening["range_pct"], 4),
-            "body_fraction": round(opening["body_fraction"], 4),
-            "close_position": round(opening["close_position"], 4),
-            "adaptive_score": round(c["adaptive_score"], 4),
-            "base_score": round(c["base_score"], 4),
-            "score": round(c["score"], 4),
-            "spy_regime": c["spy_regime"],
-            "pattern_tags": pattern_tags_str,
-            "action": "entry_candidate"
+            "direction": candidate["direction"],
+            "latest_price": round(candidate["latest_price"], 4),
+            "opening_open": round(candidate["opening"]["open"], 4),
+            "opening_high": round(candidate["opening"]["high"], 4),
+            "opening_low": round(candidate["opening"]["low"], 4),
+            "opening_close": round(candidate["opening"]["close"], 4),
+            "opening_volume": round(candidate["opening"]["volume"], 2),
+            "relative_volume": round(candidate["relative_volume"], 4),
+            "range_pct": round(candidate["opening"]["range_pct"], 4),
+            "body_fraction": round(candidate["opening"]["body_fraction"], 4),
+            "close_position": round(candidate["opening"]["close_position"], 4),
+            "adaptive_score": round(candidate["adaptive_score"], 4),
+            "base_score": round(candidate["base_score"], 4),
+            "score": round(candidate["score"], 4),
+            "spy_regime": candidate["spy_regime"],
+            "pattern_tags": "|".join(candidate["pattern_tags"]),
+            "action": "entry_attempt"
         }, SIGNAL_COLUMNS)
 
-        order_result = submit_entry_order(symbol, c["qty"], c["direction"])
-        if not order_result:
+        result = submit_entry_order(symbol, candidate["qty"], candidate["direction"])
+        if not result:
             continue
 
-        entry_fill = order_result["fill_price"]
+        entry_fill = result["fill_price"]
         if entry_fill is None:
-            entry_fill = c["latest_price"]
+            entry_fill = candidate["latest_price"]
 
-        state["trades_today"] += 1
-        state["symbols_traded_today"].append(symbol)
-        state["positions"][symbol] = {
+        tracked = {
             "symbol": symbol,
-            "direction": c["direction"],
-            "qty": c["qty"],
-            "entry_order_id": order_result["order_id"],
-            "entry_price_est": c["entry_price"],
-            "entry_price_fill": round(entry_fill, 4),
-            "stop_price": c["stop_price"],
-            "target_price": c["target_price"],
-            "score": round(c["score"], 4),
-            "relative_volume": round(c["relative_volume"], 4),
-            "range_pct": round(opening["range_pct"], 4),
-            "spy_regime": c["spy_regime"],
-            "pattern_tags": pattern_tags_str,
             "status": "open",
-            "entered_at_et": current.strftime("%Y-%m-%d %H:%M:%S")
+            "direction": candidate["direction"],
+            "qty": int(candidate["qty"]),
+            "entry_order_id": result["order_id"],
+            "entry_price_est": round(candidate["entry_price"], 4),
+            "entry_price_fill": round(entry_fill, 4),
+            "stop_price": round(candidate["stop_price"], 4),
+            "target_price": round(candidate["target_price"], 4),
+            "score": round(candidate["score"], 4),
+            "relative_volume": round(candidate["relative_volume"], 4),
+            "range_pct": round(candidate["opening"]["range_pct"], 4),
+            "spy_regime": candidate["spy_regime"],
+            "pattern_tags": "|".join(candidate["pattern_tags"]),
+            "opened_at_et": current.strftime("%Y-%m-%d %H:%M:%S")
         }
+
+        state["positions"][symbol] = tracked
+        state["trades_today"] = int(state.get("trades_today", 0)) + 1
+        state["symbols_traded_today"] = list(set(state.get("symbols_traded_today", [])) | {symbol})
 
         append_csv(TRADES_LOG_FILE, {
             "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
-            "direction": c["direction"],
+            "direction": candidate["direction"],
             "event": "entry_submitted",
-            "qty": c["qty"],
-            "entry_order_id": order_result["order_id"],
-            "entry_price_est": c["entry_price"],
+            "qty": int(candidate["qty"]),
+            "entry_order_id": result["order_id"],
+            "entry_price_est": round(candidate["entry_price"], 4),
             "entry_price_fill": round(entry_fill, 4),
-            "stop_price": c["stop_price"],
-            "target_price": c["target_price"],
+            "stop_price": round(candidate["stop_price"], 4),
+            "target_price": round(candidate["target_price"], 4),
             "exit_order_id": "",
             "exit_price_est": "",
             "exit_price_fill": "",
-            "reason": "opening_range_signal",
+            "reason": "opening_5m_breakout",
             "gross_pnl": "",
             "sec_fee": "",
             "net_pnl": "",
-            "score": round(c["score"], 4),
-            "relative_volume": round(c["relative_volume"], 4),
-            "range_pct": round(opening["range_pct"], 4),
-            "spy_regime": c["spy_regime"],
-            "pattern_tags": pattern_tags_str
+            "score": round(candidate["score"], 4),
+            "relative_volume": round(candidate["relative_volume"], 4),
+            "range_pct": round(candidate["opening"]["range_pct"], 4),
+            "spy_regime": candidate["spy_regime"],
+            "pattern_tags": "|".join(candidate["pattern_tags"])
         }, TRADE_COLUMNS)
 
+        currently_held.add(symbol)
+        slots_left -= 1
         save_state(state)
 
     return state
 
 
 # -----------------------------
-# Exit management
+# Position management / exits
 # -----------------------------
 def maybe_manage_and_exit_positions(state: Dict) -> Dict:
     current = now_et()
@@ -1048,24 +1056,27 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
 
     if not live_positions:
         log("No live positions to manage.")
+        state["positions"] = {}
+        save_state(state)
         return state
 
-    for symbol, live_pos in live_positions.items():
-        tracked = state["positions"].get(symbol)
-        if not tracked or tracked.get("status") not in {"open", "exit_rejected"}:
+    tracked_positions = state.get("positions", {})
+    tracked_symbols = list(tracked_positions.keys())
+
+    for symbol in tracked_symbols:
+        tracked = tracked_positions.get(symbol, {})
+        if symbol not in live_positions:
+            tracked["status"] = "missing_from_broker"
+            tracked_positions[symbol] = tracked
             continue
 
-        direction = tracked["direction"]
-        qty = int(live_pos["qty"])
-        current_price = safe_float(live_pos["current_price"], None)
-        if current_price is None:
-            current_price = get_latest_trade_price(symbol)
-        if current_price is None:
-            continue
-
-        stop_price = safe_float(tracked["stop_price"])
-        target_price = safe_float(tracked["target_price"])
-        entry_fill = safe_float(tracked.get("entry_price_fill"), safe_float(tracked.get("entry_price_est")))
+        broker_pos = live_positions[symbol]
+        direction = tracked.get("direction", broker_pos["side"])
+        qty = int(broker_pos["qty"])
+        current_price = safe_float(broker_pos["current_price"], 0.0)
+        entry_fill = safe_float(tracked.get("entry_price_fill"), broker_pos["avg_entry_price"])
+        stop_price = safe_float(tracked.get("stop_price"), 0.0)
+        target_price = safe_float(tracked.get("target_price"), 0.0)
 
         reason = None
 
@@ -1081,7 +1092,7 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
                 reason = "target_hit"
 
         if is_force_exit_time(current):
-            reason = "time_exit_1100"
+            reason = "time_exit_1245"
 
         if not reason:
             continue
@@ -1089,7 +1100,7 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
         exit_result = submit_exit_order(symbol, qty, direction)
         if not exit_result:
             tracked["status"] = "exit_rejected"
-            state["positions"][symbol] = tracked
+            tracked_positions[symbol] = tracked
             save_state(state)
             continue
 
@@ -1139,11 +1150,12 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
         tracked["gross_pnl"] = pnl["gross_pnl"]
         tracked["sec_fee"] = pnl["sec_fee"]
         tracked["net_pnl"] = pnl["net_pnl"]
-        state["positions"][symbol] = tracked
+        tracked_positions[symbol] = tracked
 
         state = update_kill_switch(state)
         save_state(state)
 
+    state["positions"] = tracked_positions
     return state
 
 
@@ -1170,7 +1182,6 @@ def run_bot() -> None:
         )
 
         state = maybe_manage_and_exit_positions(state)
-
         pattern_stats = refresh_pattern_stats()
 
         if is_entry_window(current):
