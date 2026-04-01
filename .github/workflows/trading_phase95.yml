@@ -2,9 +2,7 @@ name: trading_phase95
 
 on:
   schedule:
-    # Market open burst (9:30–9:50 ET)
     - cron: "30,40,50 13 * * 1-5"
-    # Every 10 minutes until 11:00 ET
     - cron: "0,10,20,30,40,50 14-15 * * 1-5"
   workflow_dispatch:
 
@@ -13,25 +11,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install alpaca-trade-api pandas numpy pytz
+      - run: pip install --upgrade pip
+      - run: pip install alpaca-trade-api pandas numpy pytz
 
-      - name: Run bot_phase95
+      - name: Run bot
+        run: python bot_phase95.py
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
-        run: python bot_phase95.py
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
