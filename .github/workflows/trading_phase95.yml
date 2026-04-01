@@ -21,11 +21,6 @@ jobs:
       - run: pip install alpaca-trade-api pandas numpy pytz
 
       - name: Run bot
-        run: python bot_phase95.py
-        env:
-          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
-          APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
