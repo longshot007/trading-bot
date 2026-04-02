@@ -12,15 +12,15 @@ import alpaca_trade_api as tradeapi
 
 
 # ============================================================
-# bot_phase95.py
+# bot.py
 # Phase 9.5
 # - Opening-range signal based on first 5-minute candle
 # - Softer SPY filter
 # - Actual fill reconciliation
 # - Lightweight profitability learning from logged pattern tags
-# - Entries allowed through 11:00 ET
-# - Forced flat at 11:00 ET
-# - Turnkey IEX-feed revision to avoid recent SIP subscription errors
+# - Entries allowed from 9:30 ET up to (but not including) 1:00 PM ET
+# - Forced flat at 1:00 PM ET
+# - IEX-feed revision to avoid recent SIP subscription errors
 # ============================================================
 
 
@@ -87,12 +87,14 @@ NEAR_BREAKOUT_PCT = 0.0015
 
 TARGET_R_MULTIPLE = 2.0
 
+# Entry window: 9:30 ET until just before 1:00 PM ET
 ENTRY_START_HOUR = 9
-ENTRY_START_MINUTE = 35
-ENTRY_END_HOUR = 11
+ENTRY_START_MINUTE = 30
+ENTRY_END_HOUR = 13
 ENTRY_END_MINUTE = 0
 
-FORCE_EXIT_HOUR = 11
+# Forced flat at 1:00 PM ET
+FORCE_EXIT_HOUR = 13
 FORCE_EXIT_MINUTE = 0
 
 SPY_SYMBOL = "SPY"
@@ -269,30 +271,24 @@ def get_current_positions() -> Dict[str, Dict]:
     return positions
 
 
-# Define entry window (NY time)
-entry_start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-entry_end   = now_et.replace(hour=13, minute=0, second=0, microsecond=0)  # 10:00 PT
-
-if not (entry_start <= now_et <= entry_end):
-    log("Outside entry window for new entries.")
-    return
-
-
-def is_force_exit_time(current_et: datetime) -> bool:
-   def is_entry_window(current_et: datetime) -> bool:
+def is_entry_window(current_et: datetime) -> bool:
     entry_start = current_et.replace(
-        hour=9,
-        minute=30,
+        hour=ENTRY_START_HOUR,
+        minute=ENTRY_START_MINUTE,
         second=0,
         microsecond=0
     )
     entry_end = current_et.replace(
-        hour=13,
-        minute=0,
+        hour=ENTRY_END_HOUR,
+        minute=ENTRY_END_MINUTE,
         second=0,
         microsecond=0
     )
-    return entry_start <= current_et <= entry_end
+    # End is exclusive so the bot cannot open new trades at the exact force-exit cutoff.
+    return entry_start <= current_et < entry_end
+
+
+def is_force_exit_time(current_et: datetime) -> bool:
     cutoff = current_et.replace(
         hour=FORCE_EXIT_HOUR,
         minute=FORCE_EXIT_MINUTE,
@@ -1135,7 +1131,7 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
                 reason = "target_hit"
 
         if is_force_exit_time(current):
-            reason = "time_exit_1100"
+            reason = "time_exit_1300"
 
         if not reason:
             continue
@@ -1207,7 +1203,7 @@ def maybe_manage_and_exit_positions(state: Dict) -> Dict:
 # Main
 # -----------------------------
 def run_bot() -> None:
-    log("=== bot_phase95.py start ===")
+    log("=== bot.py start ===")
     ensure_dirs()
 
     state = load_state()
@@ -1241,7 +1237,7 @@ def run_bot() -> None:
             f"realized_net_pnl_today={state.get('realized_net_pnl_today', 0.0)} "
             f"kill_switch={state.get('kill_switch', False)}"
         )
-        log("=== bot_phase95.py end ===")
+        log("=== bot.py end ===")
 
     except Exception as e:
         log(f"Fatal error: {e}")
