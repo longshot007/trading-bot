@@ -269,20 +269,13 @@ def get_current_positions() -> Dict[str, Dict]:
     return positions
 
 
-def is_entry_window(current_et: datetime) -> bool:
-    start = current_et.replace(
-        hour=ENTRY_START_HOUR,
-        minute=ENTRY_START_MINUTE,
-        second=0,
-        microsecond=0
-    )
-    end = current_et.replace(
-        hour=ENTRY_END_HOUR,
-        minute=ENTRY_END_MINUTE,
-        second=0,
-        microsecond=0
-    )
-    return start <= current_et < end
+# Define entry window (NY time)
+entry_start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+entry_end   = now_et.replace(hour=13, minute=0, second=0, microsecond=0)  # 10:00 PT
+
+if not (entry_start <= now_et <= entry_end):
+    log("Outside entry window for new entries.")
+    return
 
 
 def is_force_exit_time(current_et: datetime) -> bool:
