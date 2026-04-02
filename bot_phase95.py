@@ -279,6 +279,20 @@ if not (entry_start <= now_et <= entry_end):
 
 
 def is_force_exit_time(current_et: datetime) -> bool:
+   def is_entry_window(current_et: datetime) -> bool:
+    entry_start = current_et.replace(
+        hour=9,
+        minute=30,
+        second=0,
+        microsecond=0
+    )
+    entry_end = current_et.replace(
+        hour=13,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+    return entry_start <= current_et <= entry_end
     cutoff = current_et.replace(
         hour=FORCE_EXIT_HOUR,
         minute=FORCE_EXIT_MINUTE,
