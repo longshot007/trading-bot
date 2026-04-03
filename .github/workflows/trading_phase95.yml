@@ -2,8 +2,12 @@ name: trading_phase95
 
 on:
   schedule:
+    # 9:30, 9:40, 9:50 ET
     - cron: "30,40,50 13 * * 1-5"
+    # 10:00–11:50 ET every 10 minutes
     - cron: "0,10,20,30,40,50 14-15 * * 1-5"
+    # 12:00 ET final management run
+    - cron: "0 16 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -11,16 +15,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: pip install --upgrade pip
-      - run: pip install alpaca-trade-api pandas numpy pytz
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alpaca-trade-api pandas numpy pytz
 
-      - name: Run bot
+      - name: Run bot_phase95
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
