@@ -1,920 +1,1227 @@
 import os
 import json
-import math
+import time
 import traceback
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, time as dtime
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import pytz
 import alpaca_trade_api as tradeapi
 
 
-BOT_NAME = "bot_phase95.py"
+# ============================================================
+# bot_phase95.py
+# Phase 9.6
+# - Opening-range signal based on first 5-minute candle
+# - Entries allowed through 13:00 ET
+# - Forced flat at 13:00 ET
+# - Workflow and bot time windows aligned
+# - Uses IEX by default to avoid SIP subscription failures
+# - Includes scanner reject logging
+# - Includes SEC Section 31 fee handling for sell orders
+# ============================================================
 
-UTC = timezone.utc
-ET = ZoneInfo("America/New_York")
-PT = ZoneInfo("America/Los_Angeles")
 
-LOG_FILE = "phase95_run_log.csv"
-TRADE_LOG_FILE = "phase95_trade_log.csv"
-SUMMARY_FILE = "phase95_run_summary.json"
-STATE_FILE = "phase95_state.json"
+# -----------------------------
+# Environment / API
+# -----------------------------
+APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
-SEC_FEE_RATE = 0.0000206  # estimated SEC Section 31 fee on sells
+if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
+    raise RuntimeError("Missing Alpaca credentials in environment variables.")
 
-# Session controls
-MARKET_OPEN_ET = (9, 30)
-ENTRY_START_ET = (9, 40)
-ENTRY_END_ET = (13, 0)
-FORCE_FLAT_ET = (15, 45)
+api = tradeapi.REST(
+    APCA_API_KEY_ID,
+    APCA_API_SECRET_KEY,
+    APCA_API_BASE_URL,
+    api_version="v2",
+)
 
-# Risk controls
-RISK_PER_TRADE = 0.01
-MAX_TOTAL_POSITIONS = 4
-MAX_NEW_ORDERS_PER_RUN = 2
-MAX_NOTIONAL_PER_POSITION_PCT = 0.20
-MIN_ORDER_NOTIONAL = 250.0
 
-# Scanner controls
-MIN_PRICE = 5.0
+# -----------------------------
+# Time zones
+# -----------------------------
+EASTERN = pytz.timezone("America/New_York")
+PACIFIC = pytz.timezone("America/Los_Angeles")
+UTC = pytz.UTC
+
+
+# -----------------------------
+# Files
+# -----------------------------
+DATA_DIR = "data"
+LOG_DIR = "logs"
+
+STATE_FILE = os.path.join(DATA_DIR, "phase95_state.json")
+TRADES_LOG_FILE = os.path.join(LOG_DIR, "phase95_trades_log.csv")
+SIGNALS_LOG_FILE = os.path.join(LOG_DIR, "phase95_signals_log.csv")
+PATTERN_STATS_FILE = os.path.join(DATA_DIR, "phase95_pattern_stats.json")
+
+
+# -----------------------------
+# Strategy parameters
+# -----------------------------
+MAX_TRADES_PER_DAY = 10
+MAX_OPEN_POSITIONS = 5
+RISK_PER_TRADE_PCT = 0.01
+MAX_DAILY_NET_LOSS_PCT = 0.02
+MAX_DAILY_LOSING_TRADES = 3
+
+MIN_PRICE = 3.0
 MAX_PRICE = 250.0
-MIN_RVOL = 1.05
-MIN_DOLLAR_VOL_1M = 200000
-SIGNAL_THRESHOLD = 3.2
-PROFIT_TARGET_R = 2.0
-TRAIL_TRIGGER_R = 1.0
-TRAIL_STOP_R_MULT = 0.30  # once >1R, trail to lock ~0.3R
-MAX_BARS = 120  # enough to cover session start through early afternoon
+MIN_DOLLAR_VOLUME = 400_000
+MIN_RELATIVE_VOLUME = 0.35
 
-# Longable / shortable universes separated
-LONG_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "GOOGL", "TSLA", "NFLX", "PLTR",
-    "MU", "AVGO", "QCOM", "INTC", "SMCI", "CRM", "UBER", "SHOP", "COIN", "HOOD",
-    "ADBE", "PANW", "SNOW", "CRWD", "ARM", "TSM", "BABA", "JPM", "BAC", "WFC",
-    "XOM", "CVX", "OXY", "SLB", "HAL", "PFE", "LLY", "MRK", "UNH", "ABBV",
-    "SPY", "QQQ", "IWM", "DIA", "SOXL", "TQQQ", "SQQQ", "MARA", "RIOT", "MSTR",
-    "DIS", "BA", "CAT", "DE", "NKE", "COST", "WMT", "HD", "LOW", "ORCL"
+MIN_5M_RANGE_PCT = 0.0012
+MAX_5M_RANGE_PCT = 0.12
+MAX_RISK_PER_SHARE_PCT = 0.05
+
+ENTRY_BUFFER_PCT = 0.0003
+MIN_ENTRY_BUFFER_DOLLARS = 0.01
+NEAR_BREAKOUT_PCT = 0.0025
+
+TARGET_R_MULTIPLE = 2.0
+
+# 9:35 ET through 13:00 ET
+ENTRY_START_HOUR = 9
+ENTRY_START_MINUTE = 35
+ENTRY_END_HOUR = 13
+ENTRY_END_MINUTE = 0
+
+# flat at 13:00 ET
+FORCE_EXIT_HOUR = 13
+FORCE_EXIT_MINUTE = 0
+
+SPY_SYMBOL = "SPY"
+SCANNER_LIMIT = 200
+
+SEC_FEE_RATE = 0.0000206
+
+DATA_FEED_INTRADAY = "iex"
+DATA_FEED_DAILY = "iex"
+
+# Lenient but still bounded signal settings
+MIN_BODY_FRACTION = 0.18
+MAX_OPPOSITE_WICK_FRACTION = 0.72
+MIN_CLOSE_NEAR_EXTREME_LONG = 0.52
+MAX_CLOSE_NEAR_EXTREME_SHORT = 0.48
+MIN_ADAPTIVE_SCORE = -0.75
+
+DEFAULT_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "TSLA", "GOOGL", "NFLX", "INTC",
+    "MU", "PLTR", "CRM", "ADBE", "AVGO", "QCOM", "SHOP", "UBER", "COIN", "SMCI",
+    "ARM", "SOFI", "PYPL", "SNOW", "PANW", "CRWD", "ANET", "MRVL", "F", "GM",
+    "BAC", "JPM", "C", "WFC", "XOM", "CVX", "OXY", "SLB", "LLY", "UNH",
+    "JNJ", "PFE", "NKE", "DIS", "BA", "CAT", "DE", "RIOT", "MARA", "HOOD",
+    "RIVN", "LCID", "QQQ", "IWM", "DIA", "ARKK", "TQQQ", "SQQQ", "XLF", "XLK",
+    "XLE", "XBI", "SMH", "SOXX", "HIMS", "DKNG", "AFRM", "UPST", "TEM", "NIO"
 ]
 
-SHORT_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "GOOGL", "TSLA", "NFLX", "PLTR",
-    "MU", "AVGO", "QCOM", "INTC", "SMCI", "CRM", "UBER", "SHOP", "COIN", "HOOD",
-    "ADBE", "PANW", "SNOW", "CRWD", "ARM", "TSM", "BABA", "JPM", "BAC", "WFC",
-    "XOM", "CVX", "OXY", "SLB", "HAL", "PFE", "LLY", "MRK", "UNH", "ABBV",
-    "SPY", "QQQ", "IWM", "DIA", "MARA", "RIOT", "MSTR",
-    "DIS", "BA", "CAT", "DE", "NKE", "COST", "WMT", "HD", "LOW", "ORCL"
+TRADE_COLUMNS = [
+    "timestamp_et", "symbol", "direction", "event", "qty",
+    "entry_order_id", "entry_price_est", "entry_price_fill",
+    "stop_price", "target_price",
+    "exit_order_id", "exit_price_est", "exit_price_fill",
+    "reason", "gross_pnl", "sec_fee", "net_pnl",
+    "score", "relative_volume", "range_pct",
+    "spy_regime", "pattern_tags"
 ]
 
-BASE_UNIVERSE = sorted(set(LONG_UNIVERSE) | set(SHORT_UNIVERSE))
+SIGNAL_COLUMNS = [
+    "timestamp_et", "symbol", "direction", "latest_price",
+    "opening_open", "opening_high", "opening_low", "opening_close",
+    "opening_volume", "relative_volume", "range_pct",
+    "body_fraction", "close_position", "adaptive_score",
+    "base_score", "score", "spy_regime", "pattern_tags", "action", "detail"
+]
 
 
-def now_utc() -> datetime:
-    return datetime.now(UTC)
+# -----------------------------
+# Utilities
+# -----------------------------
+def ensure_dirs() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
 
 
 def now_et() -> datetime:
-    return now_utc().astimezone(ET)
+    return datetime.now(EASTERN)
 
 
-def now_pt() -> datetime:
-    return now_utc().astimezone(PT)
+def now_pacific() -> datetime:
+    return datetime.now(PACIFIC)
 
 
-def stamp() -> str:
-    return f"[ET {now_et().strftime('%Y-%m-%d %H:%M:%S')} | PT {now_pt().strftime('%H:%M:%S')}]"
+def log(msg: str) -> None:
+    et = now_et().strftime("%Y-%m-%d %H:%M:%S")
+    pt = now_pacific().strftime("%H:%M:%S")
+    print(f"[ET {et} | PT {pt}] {msg}")
 
 
-def safe_float(value, default=0.0) -> float:
+def safe_float(value, default=0.0):
     try:
+        if value is None or value == "":
+            return default
         return float(value)
     except Exception:
         return default
 
 
-def safe_round_qty(qty: float) -> str:
-    qty = float(qty)
-    if abs(qty - round(qty)) < 1e-9:
-        return str(int(round(qty)))
-    return f"{qty:.6f}".rstrip("0").rstrip(".")
+def append_csv(path: str, row: Dict, columns: List[str]) -> None:
+    ensure_dirs()
+    df = pd.DataFrame([row]).reindex(columns=columns)
+    exists = os.path.exists(path)
+    df.to_csv(path, mode="a" if exists else "w", index=False, header=not exists)
 
 
-def append_csv(path: str, row: dict) -> None:
-    df = pd.DataFrame([row])
-    if os.path.exists(path):
-        df.to_csv(path, mode="a", header=False, index=False)
-    else:
-        df.to_csv(path, index=False)
+def load_json(path: str, fallback):
+    if not os.path.exists(path):
+        return fallback
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return fallback
 
 
-def log(message: str) -> None:
-    line = f"{stamp()} {message}"
-    print(line)
-    append_csv(
-        LOG_FILE,
-        {
-            "utc_time": now_utc().isoformat(),
-            "et_time": now_et().isoformat(),
-            "pt_time": now_pt().isoformat(),
-            "message": message,
-        },
-    )
+def save_json(path: str, payload) -> None:
+    ensure_dirs()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
-def write_summary(summary: dict) -> None:
-    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-
-def load_state() -> dict:
-    today = now_et().date().isoformat()
-    default_state = {
-        "session_date": today,
-        "traded_today": [],
-        "entry_meta": {}
+# -----------------------------
+# Persistent state
+# -----------------------------
+def default_state() -> Dict:
+    return {
+        "date": "",
+        "trades_today": 0,
+        "losing_trades_today": 0,
+        "realized_net_pnl_today": 0.0,
+        "daily_start_equity": 0.0,
+        "symbols_traded_today": [],
+        "positions": {},
+        "last_scan_candidates": [],
+        "last_scan_summary": {},
+        "kill_switch": False,
+        "kill_switch_reason": "",
     }
 
-    if not os.path.exists(STATE_FILE):
-        return default_state
+
+def load_state() -> Dict:
+    return load_json(STATE_FILE, default_state())
+
+
+def save_state(state: Dict) -> None:
+    save_json(STATE_FILE, state)
+
+
+def load_pattern_stats() -> Dict[str, Dict]:
+    return load_json(PATTERN_STATS_FILE, {})
+
+
+def save_pattern_stats(stats: Dict[str, Dict]) -> None:
+    save_json(PATTERN_STATS_FILE, stats)
+
+
+# -----------------------------
+# Market / account
+# -----------------------------
+def get_account_equity() -> float:
+    return safe_float(api.get_account().equity, 0.0)
+
+
+def get_buying_power() -> float:
+    return safe_float(api.get_account().buying_power, 0.0)
+
+
+def reset_daily_state_if_needed(state: Dict) -> Dict:
+    today = now_et().strftime("%Y-%m-%d")
+    if state.get("date") != today:
+        state = default_state()
+        state["date"] = today
+        state["daily_start_equity"] = get_account_equity()
+        save_state(state)
+        log(f"Daily state reset. Start equity={state['daily_start_equity']:.2f}")
+    return state
+
+
+def market_is_open() -> Tuple[bool, datetime, str]:
+    current = now_et()
+
+    if current.weekday() >= 5:
+        return False, current, "weekend"
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except Exception:
-        return default_state
-
-    if state.get("session_date") != today:
-        return default_state
-
-    if "traded_today" not in state or not isinstance(state["traded_today"], list):
-        state["traded_today"] = []
-    if "entry_meta" not in state or not isinstance(state["entry_meta"], dict):
-        state["entry_meta"] = {}
-
-    return state
+        clock = api.get_clock()
+        return bool(clock.is_open), current, f"alpaca_clock_{'open' if clock.is_open else 'closed'}"
+    except Exception as e:
+        fallback_open = dtime(9, 30) <= current.time() < dtime(16, 0)
+        return fallback_open, current, f"fallback_time_window_due_to_clock_error:{e}"
 
 
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-
-def reset_state_if_new_day() -> dict:
-    state = load_state()
-    state["session_date"] = now_et().date().isoformat()
-    state.setdefault("traded_today", [])
-    state.setdefault("entry_meta", {})
-    return state
-
-
-def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-def get_api() -> tradeapi.REST:
-    key = env_required("APCA_API_KEY_ID")
-    secret = env_required("APCA_API_SECRET_KEY")
-    base_url = env_required("APCA_API_BASE_URL")
-    if not base_url.startswith("http://") and not base_url.startswith("https://"):
-        base_url = f"https://{base_url}"
-    return tradeapi.REST(key, secret, base_url, api_version="v2")
-
-
-def market_is_open(api: tradeapi.REST) -> bool:
-    return bool(api.get_clock().is_open)
-
-
-def get_session_open_et(dt_et: datetime) -> datetime:
-    return dt_et.replace(
-        hour=MARKET_OPEN_ET[0],
-        minute=MARKET_OPEN_ET[1],
+def is_entry_window(current_et: datetime) -> bool:
+    start = current_et.replace(
+        hour=ENTRY_START_HOUR,
+        minute=ENTRY_START_MINUTE,
         second=0,
-        microsecond=0
+        microsecond=0,
+    )
+    end = current_et.replace(
+        hour=ENTRY_END_HOUR,
+        minute=ENTRY_END_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    return start <= current_et <= end
+
+
+def is_force_exit_time(current_et: datetime) -> bool:
+    cutoff = current_et.replace(
+        hour=FORCE_EXIT_HOUR,
+        minute=FORCE_EXIT_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    return current_et >= cutoff
+
+
+def get_current_positions() -> Dict[str, Dict]:
+    positions = {}
+    try:
+        for p in api.list_positions():
+            qty_signed = int(float(p.qty))
+            positions[p.symbol] = {
+                "symbol": p.symbol,
+                "signed_qty": qty_signed,
+                "qty": abs(qty_signed),
+                "side": "long" if qty_signed > 0 else "short",
+                "avg_entry_price": safe_float(p.avg_entry_price, 0.0),
+                "current_price": safe_float(getattr(p, "current_price", None), 0.0),
+                "market_value": safe_float(getattr(p, "market_value", None), 0.0),
+                "unrealized_pl": safe_float(getattr(p, "unrealized_pl", None), 0.0),
+            }
+    except Exception as e:
+        log(f"Could not list positions: {e}")
+    return positions
+
+
+# -----------------------------
+# Data retrieval
+# -----------------------------
+def _normalize_bars(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if isinstance(out.index, pd.MultiIndex):
+        if "symbol" in out.index.names:
+            out = out.xs(symbol, level="symbol")
+        else:
+            out = out.xs(symbol, level=0)
+
+    idx = pd.to_datetime(out.index, utc=True)
+    out.index = idx.tz_convert(EASTERN)
+    return out.sort_index()
+
+
+def get_bars_safe(symbol: str, timeframe, start_iso: str, end_iso: str, feed: str) -> pd.DataFrame:
+    try:
+        bars = api.get_bars(
+            symbol,
+            timeframe,
+            start=start_iso,
+            end=end_iso,
+            adjustment="raw",
+            feed=feed,
+        ).df
+        return _normalize_bars(bars, symbol)
+    except Exception as e:
+        log(f"Bars error for {symbol} feed={feed}: {e}")
+        return pd.DataFrame()
+
+
+def get_minute_bars(symbol: str, minutes_back: int = 120) -> pd.DataFrame:
+    end_utc = datetime.now(UTC)
+    start_utc = end_utc - timedelta(minutes=minutes_back + 30)
+
+    bars = get_bars_safe(
+        symbol,
+        tradeapi.TimeFrame.Minute,
+        start_utc.isoformat(),
+        end_utc.isoformat(),
+        DATA_FEED_INTRADAY,
+    )
+    if not bars.empty:
+        return bars
+
+    return get_bars_safe(
+        symbol,
+        tradeapi.TimeFrame.Minute,
+        start_utc.isoformat(),
+        end_utc.isoformat(),
+        "sip",
     )
 
 
-def in_entry_window(dt_et: datetime) -> bool:
-    start = dt_et.replace(hour=ENTRY_START_ET[0], minute=ENTRY_START_ET[1], second=0, microsecond=0)
-    end = dt_et.replace(hour=ENTRY_END_ET[0], minute=ENTRY_END_ET[1], second=0, microsecond=0)
-    return start <= dt_et <= end
+def get_daily_bars(symbol: str, days: int = 20) -> pd.DataFrame:
+    end_utc = datetime.now(UTC)
+    start_utc = end_utc - timedelta(days=days + 15)
+
+    bars = get_bars_safe(
+        symbol,
+        tradeapi.TimeFrame.Day,
+        start_utc.isoformat(),
+        end_utc.isoformat(),
+        DATA_FEED_DAILY,
+    )
+    if not bars.empty:
+        return bars
+
+    return get_bars_safe(
+        symbol,
+        tradeapi.TimeFrame.Day,
+        start_utc.isoformat(),
+        end_utc.isoformat(),
+        "sip",
+    )
 
 
-def should_force_flat(dt_et: datetime) -> bool:
-    cutoff = dt_et.replace(hour=FORCE_FLAT_ET[0], minute=FORCE_FLAT_ET[1], second=0, microsecond=0)
-    return dt_et >= cutoff
+def get_latest_trade_price(symbol: str) -> Optional[float]:
+    minute_bars = get_minute_bars(symbol, 5)
+    if minute_bars.empty:
+        return None
+
+    for col in ("close", "vwap", "open"):
+        if col in minute_bars.columns:
+            px = safe_float(minute_bars.iloc[-1][col], None)
+            if px is not None and px > 0:
+                return px
+    return None
 
 
-def get_equity(api: tradeapi.REST) -> float:
-    return safe_float(api.get_account().equity)
+# -----------------------------
+# Session filtering
+# -----------------------------
+def filter_today_regular_session(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    today = now_et().date()
+    out = df[df.index.date == today].copy()
+    return out[(out.index.time >= dtime(9, 30)) & (out.index.time <= dtime(16, 0))]
 
 
-def get_buying_power(api: tradeapi.REST) -> float:
-    return safe_float(api.get_account().buying_power)
+# -----------------------------
+# Opening candle logic
+# -----------------------------
+def build_opening_5m_candle(minute_bars: pd.DataFrame) -> Optional[Dict]:
+    session = filter_today_regular_session(minute_bars)
+    if session.empty:
+        return None
+
+    first = session[(session.index.time >= dtime(9, 30)) & (session.index.time < dtime(9, 35))]
+    if len(first) < 5:
+        return None
+
+    open_ = float(first.iloc[0]["open"])
+    high_ = float(first["high"].max())
+    low_ = float(first["low"].min())
+    close_ = float(first.iloc[-1]["close"])
+    volume_ = float(first["volume"].sum())
+
+    range_ = max(high_ - low_, 0.0001)
+    body_fraction = abs(close_ - open_) / range_
+    upper_wick = high_ - max(open_, close_)
+    lower_wick = min(open_, close_) - low_
+    close_position = (close_ - low_) / range_
+    direction = "long" if close_ >= open_ else "short"
+    opposite_wick_fraction = (lower_wick / range_) if direction == "long" else (upper_wick / range_)
+
+    return {
+        "open": open_,
+        "high": high_,
+        "low": low_,
+        "close": close_,
+        "volume": volume_,
+        "range": range_,
+        "range_pct": range_ / max(open_, 0.0001),
+        "body_fraction": body_fraction,
+        "close_position": close_position,
+        "direction": direction,
+        "opposite_wick_fraction": opposite_wick_fraction,
+    }
 
 
-def get_positions(api: tradeapi.REST) -> list:
+def opening_candle_is_valid(opening: Dict) -> bool:
+    if opening["range_pct"] < MIN_5M_RANGE_PCT or opening["range_pct"] > MAX_5M_RANGE_PCT:
+        return False
+    if opening["body_fraction"] < MIN_BODY_FRACTION:
+        return False
+    if opening["opposite_wick_fraction"] > MAX_OPPOSITE_WICK_FRACTION:
+        return False
+
+    if opening["direction"] == "long":
+        return opening["close_position"] >= MIN_CLOSE_NEAR_EXTREME_LONG
+    return opening["close_position"] <= MAX_CLOSE_NEAR_EXTREME_SHORT
+
+
+def build_trade_levels(opening: Dict, latest_price: float) -> Dict:
+    buffer_amt = max(latest_price * ENTRY_BUFFER_PCT, MIN_ENTRY_BUFFER_DOLLARS)
+
+    if opening["direction"] == "long":
+        entry_price = opening["high"] + buffer_amt
+        stop_price = opening["low"] - buffer_amt
+        risk_per_share = entry_price - stop_price
+        target_price = entry_price + TARGET_R_MULTIPLE * risk_per_share
+    else:
+        entry_price = opening["low"] - buffer_amt
+        stop_price = opening["high"] + buffer_amt
+        risk_per_share = stop_price - entry_price
+        target_price = entry_price - TARGET_R_MULTIPLE * risk_per_share
+
+    return {
+        "entry_price": round(entry_price, 4),
+        "stop_price": round(stop_price, 4),
+        "target_price": round(target_price, 4),
+        "risk_per_share": round(risk_per_share, 4),
+        "risk_per_share_pct": round(risk_per_share / max(abs(entry_price), 0.0001), 4),
+    }
+
+
+def breakout_is_confirmed(opening: Dict, latest_price: float, levels: Dict) -> bool:
+    trigger = levels["entry_price"]
+    if opening["direction"] == "long":
+        return latest_price >= trigger * (1 - NEAR_BREAKOUT_PCT)
+    return latest_price <= trigger * (1 + NEAR_BREAKOUT_PCT)
+
+
+# -----------------------------
+# SPY regime
+# -----------------------------
+def compute_intraday_vwap(df: pd.DataFrame) -> pd.Series:
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    cum_pv = (typical * df["volume"]).cumsum()
+    cum_vol = df["volume"].replace(0, np.nan).cumsum()
+    return cum_pv / cum_vol
+
+
+def get_spy_regime() -> Dict:
     try:
-        return list(api.list_positions())
+        bars = filter_today_regular_session(get_minute_bars(SPY_SYMBOL, 240))
+        if len(bars) < 10:
+            return {"regime": "neutral"}
+
+        bars = bars.copy()
+        bars["vwap"] = compute_intraday_vwap(bars)
+        opening = build_opening_5m_candle(bars)
+        if not opening:
+            return {"regime": "neutral"}
+
+        last_close = float(bars.iloc[-1]["close"])
+        vwap = float(bars.iloc[-1]["vwap"])
+        midpoint = (opening["high"] + opening["low"]) / 2.0
+
+        if last_close > vwap and last_close > midpoint:
+            regime = "bullish"
+        elif last_close < vwap and last_close < midpoint:
+            regime = "bearish"
+        else:
+            regime = "neutral"
+
+        return {
+            "regime": regime,
+            "last": round(last_close, 4),
+            "vwap": round(vwap, 4),
+        }
+    except Exception as e:
+        log(f"SPY regime error: {e}")
+        return {"regime": "neutral"}
+
+
+def spy_score_adjustment(spy_regime: str, direction: str) -> float:
+    if spy_regime == "neutral":
+        return 0.0
+    if direction == "long":
+        return 0.60 if spy_regime == "bullish" else -0.35
+    return 0.60 if spy_regime == "bearish" else -0.35
+
+
+# -----------------------------
+# Volume / learning / scoring
+# -----------------------------
+def compute_relative_volume(symbol: str, opening_volume: float) -> float:
+    daily = get_daily_bars(symbol, 20)
+    if daily.empty or len(daily) < 5:
+        return 1.0
+
+    avg_daily_vol = float(daily["volume"].tail(10).mean())
+    if avg_daily_vol <= 0:
+        return 1.0
+
+    opening_proxy = avg_daily_vol / 78.0
+    if opening_proxy <= 0:
+        return 1.0
+
+    return opening_volume / opening_proxy
+
+
+def read_trade_log() -> pd.DataFrame:
+    if not os.path.exists(TRADES_LOG_FILE):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(TRADES_LOG_FILE)
     except Exception:
-        return []
+        return pd.DataFrame()
 
 
-def get_open_orders(api: tradeapi.REST) -> list:
+def build_pattern_stats() -> Dict[str, Dict]:
+    df = read_trade_log()
+    if df.empty or "event" not in df.columns:
+        return {}
+
+    exits = df[df["event"] == "exit_submitted"].copy()
+    stats: Dict[str, Dict] = {}
+
+    for _, row in exits.iterrows():
+        tags_str = str(row.get("pattern_tags", "")).strip()
+        if not tags_str or tags_str == "nan":
+            continue
+
+        pnl = safe_float(row.get("net_pnl"), 0.0)
+        win = 1 if pnl > 0 else 0
+
+        for tag in [t for t in tags_str.split("|") if t]:
+            stats.setdefault(tag, {"count": 0, "wins": 0, "net_pnl_sum": 0.0})
+            stats[tag]["count"] += 1
+            stats[tag]["wins"] += win
+            stats[tag]["net_pnl_sum"] += pnl
+
+    return stats
+
+
+def refresh_pattern_stats() -> Dict[str, Dict]:
+    stats = build_pattern_stats()
+    save_pattern_stats(stats)
+    return stats
+
+
+def adaptive_pattern_score(tags: List[str], stats: Dict[str, Dict]) -> float:
+    if not tags:
+        return 0.0
+
+    values = []
+    for tag in tags:
+        item = stats.get(tag)
+        if not item:
+            continue
+
+        count = int(item.get("count", 0))
+        wins = int(item.get("wins", 0))
+        net_sum = safe_float(item.get("net_pnl_sum", 0.0), 0.0)
+
+        win_rate = (wins + 2.0) / (count + 4.0)
+        pnl_per_trade = net_sum / max(count, 1)
+        score = (win_rate - 0.5) * 1.4 + max(-0.25, min(0.25, pnl_per_trade / 60.0))
+        if count < 5:
+            score *= 0.5
+        values.append(score)
+
+    return float(np.mean(values)) if values else 0.0
+
+
+def candidate_pattern_tags(opening: Dict, rel_vol: float, spy_regime: str, risk_per_share_pct: float) -> List[str]:
+    tags = [f"dir_{opening['direction']}", f"spy_{spy_regime}"]
+    tags.append("rvol_high" if rel_vol >= 2.0 else "rvol_good" if rel_vol >= 1.0 else "rvol_ok")
+    tags.append("body_strong" if opening["body_fraction"] >= 0.55 else "body_ok")
+
+    if opening["direction"] == "long" and opening["close_position"] >= 0.85:
+        tags.append("close_at_high")
+    if opening["direction"] == "short" and opening["close_position"] <= 0.15:
+        tags.append("close_at_low")
+
+    tags.append("range_expanded" if opening["range_pct"] >= 0.01 else "range_normal")
+    tags.append(
+        "tight_risk" if risk_per_share_pct <= 0.015
+        else "normal_risk" if risk_per_share_pct <= 0.03
+        else "wide_risk"
+    )
+    return tags
+
+
+def base_candidate_score(opening: Dict, rel_vol: float, latest_price: float) -> float:
+    score = rel_vol * 3.0
+    score += opening["range_pct"] * 80.0
+    score += opening["body_fraction"] * 1.2
+    score += opening["close_position"] if opening["direction"] == "long" else (1.0 - opening["close_position"])
+    score += latest_price / 1500.0
+    return score
+
+
+# -----------------------------
+# Sizing / orders / pnl
+# -----------------------------
+def calculate_qty(entry_price: float, stop_price: float, equity: float, buying_power: float) -> int:
+    risk_per_share = abs(entry_price - stop_price)
+    if risk_per_share <= 0:
+        return 0
+
+    risk_budget = equity * RISK_PER_TRADE_PCT
+    qty_by_risk = int(risk_budget // risk_per_share)
+    qty_by_bp = int((buying_power * 0.95) // max(entry_price, 0.01))
+    return max(0, min(qty_by_risk, qty_by_bp))
+
+
+def wait_for_fill_price(order_id: str, retries: int = 6, sleep_seconds: int = 2) -> Tuple[Optional[float], str]:
+    for _ in range(retries):
+        try:
+            order = api.get_order(order_id)
+            status = str(order.status).lower()
+            fill = safe_float(getattr(order, "filled_avg_price", None), None)
+            if status in {"filled", "partially_filled"} and fill is not None:
+                return fill, status
+            if status in {"canceled", "expired", "rejected"}:
+                return None, status
+        except Exception:
+            pass
+        time.sleep(sleep_seconds)
+    return None, "timeout"
+
+
+def submit_entry_order(symbol: str, qty: int, direction: str) -> Optional[Dict]:
+    side = "buy" if direction == "long" else "sell"
     try:
-        return list(api.list_orders(status="open", limit=500))
-    except Exception:
-        return []
-
-
-def symbols_with_exposure(api: tradeapi.REST) -> set:
-    out = set()
-    for p in get_positions(api):
-        out.add(p.symbol)
-    for o in get_open_orders(api):
-        out.add(o.symbol)
-    return out
-
-
-def cancel_orders_for_symbol(api: tradeapi.REST, symbol: str) -> None:
-    for order in get_open_orders(api):
-        if getattr(order, "symbol", "") == symbol:
-            try:
-                api.cancel_order(order.id)
-                log(f"Cancelled open order for {symbol} | order_id={order.id}")
-            except Exception as exc:
-                log(f"Cancel failed for {symbol}: {exc}")
-
-
-def close_position_market(api: tradeapi.REST, position, reason: str) -> None:
-    symbol = position.symbol
-    qty_abs = abs(safe_float(position.qty))
-    if qty_abs <= 0:
-        return
-
-    side = "sell" if safe_float(position.qty) > 0 else "buy"
-
-    try:
-        cancel_orders_for_symbol(api, symbol)
-        api.submit_order(
+        order = api.submit_order(
             symbol=symbol,
-            qty=safe_round_qty(qty_abs),
+            qty=qty,
             side=side,
             type="market",
             time_in_force="day",
         )
-        append_csv(
-            TRADE_LOG_FILE,
-            {
-                "utc_time": now_utc().isoformat(),
-                "et_time": now_et().isoformat(),
-                "pt_time": now_pt().isoformat(),
-                "symbol": symbol,
-                "action": "force_close",
-                "qty": qty_abs,
-                "side": side,
-                "reason": reason,
-                "market_value": safe_float(getattr(position, "market_value", 0)),
-                "unrealized_pl": safe_float(getattr(position, "unrealized_pl", 0)),
-            },
-        )
-        log(f"Flattened {symbol} qty={qty_abs} reason={reason}")
-    except Exception as exc:
-        log(f"Failed to flatten {symbol}: {exc}")
+        log(f"ENTRY submitted: {symbol} {direction} qty={qty} order_id={order.id}")
+        fill_price, fill_status = wait_for_fill_price(order.id)
+        return {"order_id": order.id, "fill_price": fill_price, "fill_status": fill_status}
+    except Exception as e:
+        log(f"Entry order failed for {symbol}: {e}")
+        return None
 
 
-def get_latest_trade_price(api: tradeapi.REST, symbol: str) -> float:
+def submit_exit_order(symbol: str, qty: int, position_side: str) -> Optional[Dict]:
+    exit_side = "sell" if position_side == "long" else "buy"
     try:
-        return safe_float(api.get_latest_trade(symbol).price)
-    except Exception:
-        return 0.0
-
-
-def get_order_map_by_symbol(api: tradeapi.REST) -> dict:
-    order_map = {}
-    for order in get_open_orders(api):
-        order_map.setdefault(order.symbol, []).append(order)
-    return order_map
-
-
-def cancel_order_by_id(api: tradeapi.REST, order_id: str) -> None:
-    try:
-        api.cancel_order(order_id)
-    except Exception as exc:
-        log(f"Cancel order failed {order_id}: {exc}")
-
-
-def submit_trailing_bracket_replacement(
-    api: tradeapi.REST,
-    symbol: str,
-    position_qty_abs: float,
-    strategy_side: str,
-    target_price: float,
-    new_stop_price: float,
-) -> bool:
-    try:
-        close_side = "sell" if strategy_side == "long" else "buy"
-        api.submit_order(
+        order = api.submit_order(
             symbol=symbol,
-            qty=safe_round_qty(position_qty_abs),
-            side=close_side,
+            qty=qty,
+            side=exit_side,
             type="market",
             time_in_force="day",
-            order_class="oto",
-            stop_loss={"stop_price": round(new_stop_price, 2)},
         )
-        log(f"Submitted replacement protective stop for {symbol} at {new_stop_price:.2f}")
-        return True
-    except Exception as exc:
-        log(f"Failed replacement stop for {symbol}: {exc}")
-        return False
+        log(f"EXIT submitted: {symbol} {position_side} qty={qty} order_id={order.id}")
+        fill_price, fill_status = wait_for_fill_price(order.id)
+        return {"order_id": order.id, "fill_price": fill_price, "fill_status": fill_status}
+    except Exception as e:
+        log(f"Exit order failed for {symbol}: {e}")
+        return None
 
 
-def manage_open_positions(api: tradeapi.REST, state: dict) -> None:
-    positions = get_positions(api)
-    if not positions:
-        log("No live positions to manage.")
-        return
+def compute_trade_pnl(direction: str, entry_fill: float, exit_fill: float, qty: int) -> Dict[str, float]:
+    gross = (exit_fill - entry_fill) * qty if direction == "long" else (entry_fill - exit_fill) * qty
 
-    et_now = now_et()
+    # SEC Section 31 fee applies to sell orders.
+    # Long: sell on exit.
+    # Short: sell on entry.
+    sell_notional = exit_fill * qty if direction == "long" else entry_fill * qty
+    sec_fee = sell_notional * SEC_FEE_RATE
 
-    if should_force_flat(et_now):
-        log("Force-flat time reached. Closing all positions.")
-        for position in positions:
-            close_position_market(api, position, "force_flat_eod")
-        return
+    return {
+        "gross_pnl": round(gross, 4),
+        "sec_fee": round(sec_fee, 6),
+        "net_pnl": round(gross - sec_fee, 4),
+    }
 
-    order_map = get_order_map_by_symbol(api)
 
-    managed = 0
-    for position in positions:
-        symbol = position.symbol
-        qty_signed = safe_float(position.qty)
-        qty_abs = abs(qty_signed)
-        if qty_abs <= 0:
+# -----------------------------
+# Kill switch
+# -----------------------------
+def update_kill_switch(state: Dict) -> Dict:
+    start_equity = safe_float(state.get("daily_start_equity"), 0.0)
+    realized = safe_float(state.get("realized_net_pnl_today"), 0.0)
+    losing = int(state.get("losing_trades_today", 0))
+
+    if start_equity > 0:
+        loss_pct = max(0.0, -realized / start_equity)
+        if loss_pct >= MAX_DAILY_NET_LOSS_PCT:
+            state["kill_switch"] = True
+            state["kill_switch_reason"] = f"daily_net_loss_limit_{MAX_DAILY_NET_LOSS_PCT:.2%}"
+            return state
+
+    if losing >= MAX_DAILY_LOSING_TRADES:
+        state["kill_switch"] = True
+        state["kill_switch_reason"] = f"max_losing_trades_{MAX_DAILY_LOSING_TRADES}"
+
+    return state
+
+
+# -----------------------------
+# Signal logging
+# -----------------------------
+def log_signal(
+    symbol: str,
+    direction: str,
+    latest_price: float,
+    opening: Dict,
+    rel_vol: float,
+    adaptive_score: float,
+    base_score: float,
+    score: float,
+    spy_regime: str,
+    pattern_tags: str,
+    action: str,
+    detail: str,
+) -> None:
+    current = now_et()
+    append_csv(
+        SIGNALS_LOG_FILE,
+        {
+            "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "direction": direction,
+            "latest_price": round(latest_price, 4),
+            "opening_open": round(opening["open"], 4),
+            "opening_high": round(opening["high"], 4),
+            "opening_low": round(opening["low"], 4),
+            "opening_close": round(opening["close"], 4),
+            "opening_volume": int(opening["volume"]),
+            "relative_volume": round(rel_vol, 4),
+            "range_pct": round(opening["range_pct"], 4),
+            "body_fraction": round(opening["body_fraction"], 4),
+            "close_position": round(opening["close_position"], 4),
+            "adaptive_score": round(adaptive_score, 4),
+            "base_score": round(base_score, 4),
+            "score": round(score, 4),
+            "spy_regime": spy_regime,
+            "pattern_tags": pattern_tags,
+            "action": action,
+            "detail": detail,
+        },
+        SIGNAL_COLUMNS,
+    )
+
+
+# -----------------------------
+# Scanner
+# -----------------------------
+def scan_candidates(pattern_stats: Dict[str, Dict]) -> List[Dict]:
+    spy = get_spy_regime()
+    spy_regime = spy.get("regime", "neutral")
+    equity = get_account_equity()
+    buying_power = get_buying_power()
+
+    candidates: List[Dict] = []
+    reason_counts: Dict[str, int] = {}
+    checked = 0
+
+    for symbol in DEFAULT_UNIVERSE[:SCANNER_LIMIT]:
+        if symbol == SPY_SYMBOL:
             continue
 
-        strategy_side = "long" if qty_signed > 0 else "short"
-        current_price = get_latest_trade_price(api, symbol)
-        if current_price <= 0:
-            continue
+        checked += 1
 
-        meta = state.get("entry_meta", {}).get(symbol, {})
-        entry_price = safe_float(meta.get("entry_price"), safe_float(getattr(position, "avg_entry_price", 0)))
-        initial_stop = safe_float(meta.get("initial_stop"), 0)
-        initial_target = safe_float(meta.get("target_price"), 0)
-        stop_distance = safe_float(meta.get("stop_distance"), 0)
-
-        if entry_price <= 0 or initial_stop <= 0 or stop_distance <= 0:
-            continue
-
-        current_r = (
-            (current_price - entry_price) / stop_distance
-            if strategy_side == "long"
-            else (entry_price - current_price) / stop_distance
-        )
-
-        symbol_orders = order_map.get(symbol, [])
-        stop_orders = []
-        tp_orders = []
-
-        for order in symbol_orders:
-            order_type = str(getattr(order, "type", "")).lower()
-            order_side = str(getattr(order, "side", "")).lower()
-            if strategy_side == "long":
-                if order_side == "sell":
-                    if order_type in {"stop", "stop_limit"}:
-                        stop_orders.append(order)
-                    elif order_type == "limit":
-                        tp_orders.append(order)
-            else:
-                if order_side == "buy":
-                    if order_type in {"stop", "stop_limit"}:
-                        stop_orders.append(order)
-                    elif order_type == "limit":
-                        tp_orders.append(order)
-
-        current_stop_price = None
-        if stop_orders:
-            try:
-                current_stop_price = max(
-                    safe_float(getattr(o, "stop_price", 0)) if strategy_side == "short"
-                    else safe_float(getattr(o, "stop_price", 0))
-                    for o in stop_orders
-                )
-            except Exception:
-                current_stop_price = None
-
-        # Active deterioration logic
-        # If position has gone materially negative after midday, flatten it.
-        if et_now.hour >= 12:
-            if current_r <= -0.75:
-                close_position_market(api, position, "midday_deterioration")
-                managed += 1
+        try:
+            minute_bars = get_minute_bars(symbol, 240)
+            if minute_bars.empty:
+                reason_counts["no_bars"] = reason_counts.get("no_bars", 0) + 1
                 continue
 
-        # Trail once position reaches >= 1R
-        if current_r >= TRAIL_TRIGGER_R and stop_orders:
-            if strategy_side == "long":
-                desired_stop = max(entry_price + (stop_distance * TRAIL_STOP_R_MULT), current_price - (stop_distance * 0.8))
-                desired_stop = round(desired_stop, 2)
-                improve = current_stop_price is None or desired_stop > current_stop_price + 0.01
-            else:
-                desired_stop = min(entry_price - (stop_distance * TRAIL_STOP_R_MULT), current_price + (stop_distance * 0.8))
-                desired_stop = round(desired_stop, 2)
-                improve = current_stop_price is None or desired_stop < current_stop_price - 0.01
+            opening = build_opening_5m_candle(minute_bars)
+            if not opening:
+                reason_counts["no_opening_5m"] = reason_counts.get("no_opening_5m", 0) + 1
+                continue
 
-            if improve:
-                for order in stop_orders:
-                    cancel_order_by_id(api, order.id)
+            latest_price = get_latest_trade_price(symbol)
+            if latest_price is None:
+                reason_counts["no_latest_price"] = reason_counts.get("no_latest_price", 0) + 1
+                continue
 
-                close_side = "sell" if strategy_side == "long" else "buy"
-                try:
-                    api.submit_order(
-                        symbol=symbol,
-                        qty=safe_round_qty(qty_abs),
-                        side=close_side,
-                        type="stop",
-                        stop_price=desired_stop,
-                        time_in_force="day",
-                    )
-                    log(
-                        f"Trailed stop for {symbol} | side={strategy_side} "
-                        f"old_stop={current_stop_price} new_stop={desired_stop} current_r={current_r:.2f}"
-                    )
-                    state["entry_meta"].setdefault(symbol, {})
-                    state["entry_meta"][symbol]["trailed_stop"] = desired_stop
-                except Exception as exc:
-                    log(f"Failed trailing stop update for {symbol}: {exc}")
+            if latest_price < MIN_PRICE or latest_price > MAX_PRICE:
+                reason_counts["price_filter"] = reason_counts.get("price_filter", 0) + 1
+                continue
 
-        managed += 1
+            rel_vol = compute_relative_volume(symbol, opening["volume"])
+            dollar_volume = latest_price * opening["volume"]
+            levels = build_trade_levels(opening, latest_price)
+            pattern_tags = candidate_pattern_tags(opening, rel_vol, spy_regime, levels["risk_per_share_pct"])
+            adaptive_score = adaptive_pattern_score(pattern_tags, pattern_stats)
+            base_score = base_candidate_score(opening, rel_vol, latest_price)
+            total_score = base_score + adaptive_score + spy_score_adjustment(spy_regime, opening["direction"])
+            pattern_tags_str = "|".join(pattern_tags)
 
-    log(f"Managing {managed} live position(s).")
+            if not opening_candle_is_valid(opening):
+                reason_counts["opening_invalid"] = reason_counts.get("opening_invalid", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "opening_invalid")
+                continue
 
+            if rel_vol < MIN_RELATIVE_VOLUME:
+                reason_counts["rvol_filter"] = reason_counts.get("rvol_filter", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "rvol_filter")
+                continue
 
-def get_bars_df(api: tradeapi.REST, symbols: list[str], timeframe: str = "1Min", limit: int = MAX_BARS) -> pd.DataFrame:
-    if not symbols:
-        return pd.DataFrame()
+            if dollar_volume < MIN_DOLLAR_VOLUME:
+                reason_counts["dollar_volume_filter"] = reason_counts.get("dollar_volume_filter", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "dollar_volume_filter")
+                continue
 
-    try:
-        bars = api.get_bars(symbols, timeframe, limit=limit, adjustment="raw").df
-        if bars is None or bars.empty:
-            return pd.DataFrame()
-        bars = bars.reset_index()
-        if "timestamp" in bars.columns:
-            bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True)
-        return bars
-    except Exception as exc:
-        log(f"get_bars failed: {exc}")
-        return pd.DataFrame()
+            if levels["risk_per_share_pct"] > MAX_RISK_PER_SHARE_PCT:
+                reason_counts["risk_too_wide"] = reason_counts.get("risk_too_wide", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "risk_too_wide")
+                continue
 
+            if adaptive_score < MIN_ADAPTIVE_SCORE:
+                reason_counts["adaptive_filter"] = reason_counts.get("adaptive_filter", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "adaptive_filter")
+                continue
 
-def filter_to_current_session(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+            if not breakout_is_confirmed(opening, latest_price, levels):
+                reason_counts["breakout_not_ready"] = reason_counts.get("breakout_not_ready", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "breakout_not_ready")
+                continue
 
-    dt_et_now = now_et()
-    session_open_et = get_session_open_et(dt_et_now)
-    session_open_utc = session_open_et.astimezone(UTC)
+            qty = calculate_qty(levels["entry_price"], levels["stop_price"], equity, buying_power)
+            if qty < 1:
+                reason_counts["qty_zero"] = reason_counts.get("qty_zero", 0) + 1
+                log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_reject", "qty_zero")
+                continue
 
-    out = df[df["timestamp"] >= pd.Timestamp(session_open_utc)].copy()
-    if out.empty:
-        return out
-
-    out["timestamp_et"] = out["timestamp"].dt.tz_convert(ET)
-    return out
-
-
-def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df = filter_to_current_session(df)
-    if df.empty:
-        return df
-
-    chunks = []
-    for symbol, group in df.groupby("symbol"):
-        g = group.sort_values("timestamp").copy()
-
-        if g.empty:
-            continue
-
-        g["ema9"] = g["close"].ewm(span=9, adjust=False).mean()
-        g["ema20"] = g["close"].ewm(span=20, adjust=False).mean()
-        g["ema50"] = g["close"].ewm(span=50, adjust=False).mean()
-
-        # Correct session-anchored VWAP
-        typical_price = (g["high"] + g["low"] + g["close"]) / 3.0
-        cumulative_vol = g["volume"].cumsum()
-        cumulative_pv = (typical_price * g["volume"]).cumsum()
-        g["vwap"] = cumulative_pv / np.where(cumulative_vol == 0, np.nan, cumulative_vol)
-
-        g["prev_close"] = g["close"].shift(1)
-        g["tr1"] = g["high"] - g["low"]
-        g["tr2"] = (g["high"] - g["prev_close"]).abs()
-        g["tr3"] = (g["low"] - g["prev_close"]).abs()
-        g["tr"] = g[["tr1", "tr2", "tr3"]].max(axis=1)
-        g["atr14"] = g["tr"].rolling(14).mean()
-
-        g["ret_5"] = g["close"].pct_change(5)
-        g["ret_15"] = g["close"].pct_change(15)
-        g["ret_30"] = g["close"].pct_change(30)
-
-        g["avg_vol_20"] = g["volume"].rolling(20).mean()
-        g["rvol"] = g["volume"] / np.where(g["avg_vol_20"] == 0, np.nan, g["avg_vol_20"])
-        g["dollar_vol_1m"] = g["close"] * g["volume"]
-
-        g["rolling_high_20"] = g["high"].rolling(20).max().shift(1)
-        g["rolling_low_20"] = g["low"].rolling(20).min().shift(1)
-
-        chunks.append(g)
-
-    if not chunks:
-        return pd.DataFrame()
-
-    return pd.concat(chunks, ignore_index=True)
-
-
-def score_latest_row(row: pd.Series, symbol: str) -> tuple[str | None, float]:
-    price = safe_float(row["close"])
-    vwap = safe_float(row["vwap"])
-    ema9 = safe_float(row["ema9"])
-    ema20 = safe_float(row["ema20"])
-    ema50 = safe_float(row["ema50"])
-    ret_5 = safe_float(row["ret_5"])
-    ret_15 = safe_float(row["ret_15"])
-    ret_30 = safe_float(row["ret_30"])
-    rvol = safe_float(row["rvol"])
-    prior_breakout_high = safe_float(row["rolling_high_20"])
-    prior_breakout_low = safe_float(row["rolling_low_20"])
-
-    long_score = 0.0
-    short_score = 0.0
-
-    # Long side
-    if symbol in LONG_UNIVERSE:
-        if price > vwap:
-            long_score += 0.8
-        if ema9 > ema20:
-            long_score += 0.9
-        if ema20 > ema50:
-            long_score += 0.8
-        if ret_5 > 0.0010:
-            long_score += min(ret_5 * 120, 1.2)
-        if ret_15 > 0.0020:
-            long_score += min(ret_15 * 100, 1.2)
-        if ret_30 > 0.0030:
-            long_score += min(ret_30 * 80, 1.0)
-        if prior_breakout_high > 0 and price > prior_breakout_high:
-            long_score += 1.0
-        long_score += min(max(rvol - 1.0, 0.0), 1.0)
-
-    # Short side
-    if symbol in SHORT_UNIVERSE:
-        if price < vwap:
-            short_score += 0.8
-        if ema9 < ema20:
-            short_score += 0.9
-        if ema20 < ema50:
-            short_score += 0.8
-        if ret_5 < -0.0010:
-            short_score += min(abs(ret_5) * 120, 1.2)
-        if ret_15 < -0.0020:
-            short_score += min(abs(ret_15) * 100, 1.2)
-        if ret_30 < -0.0030:
-            short_score += min(abs(ret_30) * 80, 1.0)
-        if prior_breakout_low > 0 and price < prior_breakout_low:
-            short_score += 1.0
-        short_score += min(max(rvol - 1.0, 0.0), 1.0)
-
-    if long_score >= SIGNAL_THRESHOLD and long_score > short_score:
-        return "long", round(long_score, 4)
-    if short_score >= SIGNAL_THRESHOLD and short_score > long_score:
-        return "short", round(short_score, 4)
-    return None, 0.0
-
-
-def build_candidates(api: tradeapi.REST, symbols: list[str]) -> pd.DataFrame:
-    bars = get_bars_df(api, symbols, timeframe="1Min", limit=MAX_BARS)
-    if bars.empty:
-        return pd.DataFrame()
-
-    bars = enrich_indicators(bars)
-    if bars.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for symbol, group in bars.groupby("symbol"):
-        g = group.sort_values("timestamp").copy()
-        if len(g) < 55:
-            continue
-
-        row = g.iloc[-1]
-        price = safe_float(row["close"])
-        atr14 = safe_float(row["atr14"])
-        rvol = safe_float(row["rvol"])
-        dollar_vol_1m = safe_float(row["dollar_vol_1m"])
-
-        if price < MIN_PRICE or price > MAX_PRICE:
-            continue
-        if atr14 <= 0 or np.isnan(atr14):
-            continue
-        if np.isnan(rvol) or rvol < MIN_RVOL:
-            continue
-        if dollar_vol_1m < MIN_DOLLAR_VOL_1M:
-            continue
-
-        signal_side, score = score_latest_row(row, symbol)
-        if signal_side is None:
-            continue
-
-        rows.append(
-            {
+            candidate = {
                 "symbol": symbol,
-                "side": signal_side,
-                "score": score,
-                "price": round(price, 4),
-                "atr14": round(atr14, 4),
-                "rvol": round(rvol, 4),
-                "vwap": round(safe_float(row["vwap"]), 4),
-                "ema9": round(safe_float(row["ema9"]), 4),
-                "ema20": round(safe_float(row["ema20"]), 4),
-                "ema50": round(safe_float(row["ema50"]), 4),
-                "ret_5": round(safe_float(row["ret_5"]), 6),
-                "ret_15": round(safe_float(row["ret_15"]), 6),
-                "ret_30": round(safe_float(row["ret_30"]), 6),
-                "dollar_vol_1m": round(dollar_vol_1m, 2),
+                "latest_price": latest_price,
+                "opening": opening,
+                "direction": opening["direction"],
+                "entry_price": levels["entry_price"],
+                "stop_price": levels["stop_price"],
+                "target_price": levels["target_price"],
+                "risk_per_share": levels["risk_per_share"],
+                "risk_per_share_pct": levels["risk_per_share_pct"],
+                "qty": qty,
+                "relative_volume": rel_vol,
+                "dollar_volume": dollar_volume,
+                "spy_regime": spy_regime,
+                "pattern_tags": pattern_tags,
+                "adaptive_score": adaptive_score,
+                "base_score": base_score,
+                "score": total_score,
             }
-        )
 
-    if not rows:
-        return pd.DataFrame()
+            log_signal(symbol, opening["direction"], latest_price, opening, rel_vol, adaptive_score, base_score, total_score, spy_regime, pattern_tags_str, "scan_accept", "candidate")
+            candidates.append(candidate)
 
-    df = pd.DataFrame(rows)
-    return df.sort_values(["score", "rvol", "dollar_vol_1m"], ascending=False).reset_index(drop=True)
+        except Exception as e:
+            reason_counts["exception"] = reason_counts.get("exception", 0) + 1
+            log(f"Scanner skip {symbol}: {e}")
 
-
-def compute_stop_target(price: float, atr14: float, side: str) -> tuple[float, float, float]:
-    stop_distance = max(price * 0.004, atr14 * 1.15)
-
-    if side == "long":
-        stop_price = price - stop_distance
-        target_price = price + stop_distance * PROFIT_TARGET_R
-    else:
-        stop_price = price + stop_distance
-        target_price = price - stop_distance * PROFIT_TARGET_R
-
-    return round(stop_price, 2), round(target_price, 2), round(stop_distance, 4)
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    log(f"Scanner checked {checked} symbols. Candidates={len(candidates)}. Rejects={reason_counts}")
+    return candidates
 
 
-def compute_qty(equity: float, buying_power: float, price: float, stop_distance: float) -> float:
-    if price <= 0 or stop_distance <= 0:
-        return 0.0
+# -----------------------------
+# Entry management
+# -----------------------------
+def maybe_enter_new_positions(state: Dict, pattern_stats: Dict[str, Dict]) -> Dict:
+    current = now_et()
 
-    risk_budget = max(1.0, equity * RISK_PER_TRADE)
-    qty_by_risk = risk_budget / stop_distance
+    if not is_entry_window(current):
+        log("Outside entry window for new entries.")
+        return state
 
-    notional_cap = min(buying_power, equity * MAX_NOTIONAL_PER_POSITION_PCT)
-    qty_by_notional = notional_cap / price
+    state = update_kill_switch(state)
+    if state.get("kill_switch", False):
+        log(f"Kill switch active. Reason: {state.get('kill_switch_reason', '')}")
+        return state
 
-    qty = max(0.0, min(qty_by_risk, qty_by_notional))
+    broker_positions = get_current_positions()
+    if len(broker_positions) >= MAX_OPEN_POSITIONS:
+        log("Max open positions reached.")
+        return state
 
-    if qty * price < MIN_ORDER_NOTIONAL:
-        return 0.0
+    if int(state.get("trades_today", 0)) >= MAX_TRADES_PER_DAY:
+        log("Max trades per day reached.")
+        return state
 
-    # Keep to 4 decimal places to support fractionals if broker/account permits
-    qty = math.floor(qty * 10000) / 10000.0
-    return qty
+    candidates = scan_candidates(pattern_stats)
+    state["last_scan_candidates"] = [
+        {
+            "symbol": c["symbol"],
+            "score": round(c["score"], 4),
+            "direction": c["direction"],
+            "latest_price": round(c["latest_price"], 4),
+            "entry_price": round(c["entry_price"], 4),
+            "stop_price": round(c["stop_price"], 4),
+            "target_price": round(c["target_price"], 4),
+            "relative_volume": round(c["relative_volume"], 4),
+        }
+        for c in candidates[:10]
+    ]
+    state["last_scan_summary"] = {
+        "checked_at_et": current.strftime("%Y-%m-%d %H:%M:%S"),
+        "candidate_count": len(candidates),
+    }
+    save_state(state)
 
+    if not candidates:
+        log("No valid candidates found.")
+        return state
 
-def estimate_sec_fee_for_exit(notional: float) -> float:
-    return max(0.0, notional * SEC_FEE_RATE)
+    symbols_traded_today = set(state.get("symbols_traded_today", []))
+    tracked_positions = state.get("positions", {})
 
+    for c in candidates:
+        if int(state.get("trades_today", 0)) >= MAX_TRADES_PER_DAY:
+            break
+        if len(get_current_positions()) >= MAX_OPEN_POSITIONS:
+            break
 
-def place_bracket_order(
-    api: tradeapi.REST,
-    symbol: str,
-    side: str,
-    qty: float,
-    entry_est: float,
-    stop_price: float,
-    target_price: float,
-    state: dict,
-) -> bool:
-    if qty <= 0:
-        return False
+        symbol = c["symbol"]
+        if symbol in symbols_traded_today:
+            continue
+        if symbol in tracked_positions and tracked_positions[symbol].get("status") in {"open", "entry_submitted"}:
+            continue
 
-    order_side = "buy" if side == "long" else "sell"
+        order_result = submit_entry_order(symbol, c["qty"], c["direction"])
+        pattern_tags_str = "|".join(c["pattern_tags"])
 
-    try:
-        api.submit_order(
-            symbol=symbol,
-            qty=safe_round_qty(qty),
-            side=order_side,
-            type="market",
-            time_in_force="day",
-            order_class="bracket",
-            take_profit={"limit_price": round(target_price, 2)},
-            stop_loss={"stop_price": round(stop_price, 2)},
-        )
+        if not order_result:
+            log_signal(symbol, c["direction"], c["latest_price"], c["opening"], c["relative_volume"], c["adaptive_score"], c["base_score"], c["score"], c["spy_regime"], pattern_tags_str, "entry_failed", "order_failed")
+            continue
 
-        state["traded_today"].append(symbol)
-        state["entry_meta"][symbol] = {
-            "entry_price": round(entry_est, 6),
-            "initial_stop": round(stop_price, 6),
-            "target_price": round(target_price, 6),
-            "stop_distance": round(abs(entry_est - stop_price), 6),
-            "side": side,
-            "entry_time_et": now_et().isoformat(),
+        entry_fill = order_result["fill_price"] if order_result["fill_price"] is not None else c["latest_price"]
+
+        state["trades_today"] = int(state.get("trades_today", 0)) + 1
+        state.setdefault("symbols_traded_today", []).append(symbol)
+        state.setdefault("positions", {})[symbol] = {
+            "symbol": symbol,
+            "direction": c["direction"],
+            "qty": c["qty"],
+            "entry_order_id": order_result["order_id"],
+            "entry_price_est": round(c["entry_price"], 4),
+            "entry_price_fill": round(entry_fill, 4),
+            "stop_price": round(c["stop_price"], 4),
+            "target_price": round(c["target_price"], 4),
+            "score": round(c["score"], 4),
+            "relative_volume": round(c["relative_volume"], 4),
+            "range_pct": round(c["opening"]["range_pct"], 4),
+            "spy_regime": c["spy_regime"],
+            "pattern_tags": pattern_tags_str,
+            "status": "open",
+            "entered_at_et": current.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         append_csv(
-            TRADE_LOG_FILE,
+            TRADES_LOG_FILE,
             {
-                "utc_time": now_utc().isoformat(),
-                "et_time": now_et().isoformat(),
-                "pt_time": now_pt().isoformat(),
+                "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
                 "symbol": symbol,
-                "action": "submit_bracket",
-                "strategy_side": side,
-                "order_side": order_side,
-                "qty": qty,
-                "entry_est": round(entry_est, 4),
-                "stop_price": round(stop_price, 4),
-                "target_price": round(target_price, 4),
-                "sec_fee_est_exit": round(estimate_sec_fee_for_exit(qty * entry_est), 6),
+                "direction": c["direction"],
+                "event": "entry_submitted",
+                "qty": c["qty"],
+                "entry_order_id": order_result["order_id"],
+                "entry_price_est": round(c["entry_price"], 4),
+                "entry_price_fill": round(entry_fill, 4),
+                "stop_price": round(c["stop_price"], 4),
+                "target_price": round(c["target_price"], 4),
+                "exit_order_id": "",
+                "exit_price_est": "",
+                "exit_price_fill": "",
+                "reason": "",
+                "gross_pnl": "",
+                "sec_fee": "",
+                "net_pnl": "",
+                "score": round(c["score"], 4),
+                "relative_volume": round(c["relative_volume"], 4),
+                "range_pct": round(c["opening"]["range_pct"], 4),
+                "spy_regime": c["spy_regime"],
+                "pattern_tags": pattern_tags_str,
             },
+            TRADE_COLUMNS,
         )
 
-        log(
-            f"Submitted {side.upper()} bracket | "
-            f"{symbol} qty={qty} entry≈{entry_est:.2f} stop={stop_price:.2f} target={target_price:.2f}"
-        )
-        return True
-    except Exception as exc:
-        log(f"Order failed for {symbol}: {exc}")
-        return False
-
-
-def refresh_state_for_closed_positions(api: tradeapi.REST, state: dict) -> None:
-    live_symbols = {p.symbol for p in get_positions(api)}
-    to_remove = []
-
-    for symbol in list(state.get("entry_meta", {}).keys()):
-        if symbol not in live_symbols:
-            to_remove.append(symbol)
-
-    for symbol in to_remove:
-        state["entry_meta"].pop(symbol, None)
-
-
-def run_bot() -> None:
-    state = reset_state_if_new_day()
-
-    summary = {
-        "bot": BOT_NAME,
-        "utc_time": now_utc().isoformat(),
-        "et_time": now_et().isoformat(),
-        "pt_time": now_pt().isoformat(),
-        "status": "started",
-        "market_open": None,
-        "entry_window": None,
-        "equity": None,
-        "buying_power": None,
-        "scanner_candidates": 0,
-        "new_orders_submitted": 0,
-        "traded_today_count": len(state.get("traded_today", [])),
-    }
-
-    log(f"=== {BOT_NAME} start ===")
-    api = get_api()
-
-    equity = get_equity(api)
-    buying_power = get_buying_power(api)
-    summary["equity"] = equity
-    summary["buying_power"] = buying_power
-
-    log(f"Account snapshot | equity={equity:.2f} buying_power={buying_power:.2f}")
-
-    is_open = market_is_open(api)
-    summary["market_open"] = is_open
-
-    et_now = now_et()
-    summary["entry_window"] = in_entry_window(et_now)
-
-    log(f"Current ET time: {et_now.strftime('%Y-%m-%d %H:%M:%S %Z')} | PT {now_pt().strftime('%H:%M:%S %Z')}")
-
-    if not is_open:
-        log("Market is closed. Exiting cleanly.")
-        summary["status"] = "market_closed"
+        log_signal(symbol, c["direction"], c["latest_price"], c["opening"], c["relative_volume"], c["adaptive_score"], c["base_score"], c["score"], c["spy_regime"], pattern_tags_str, "entry_submitted", "order_submitted")
         save_state(state)
-        write_summary(summary)
-        return
 
-    refresh_state_for_closed_positions(api, state)
-    manage_open_positions(api, state)
+    return state
 
-    if not in_entry_window(et_now):
-        log("Outside entry window for new entries.")
-        summary["status"] = "outside_entry_window"
-        save_state(state)
-        write_summary(summary)
-        return
 
-    open_positions = get_positions(api)
-    if len(open_positions) >= MAX_TOTAL_POSITIONS:
-        log(f"Max position count reached ({len(open_positions)}/{MAX_TOTAL_POSITIONS}).")
-        summary["status"] = "max_positions_reached"
-        save_state(state)
-        write_summary(summary)
-        return
+# -----------------------------
+# Exit management
+# -----------------------------
+def maybe_manage_and_exit_positions(state: Dict) -> Dict:
+    current = now_et()
+    broker_positions = get_current_positions()
+    tracked_positions = state.get("positions", {})
 
-    candidates = build_candidates(api, BASE_UNIVERSE)
-    if candidates.empty:
-        log("Scanner found 0 candidates.")
-        summary["status"] = "no_candidates"
-        save_state(state)
-        write_summary(summary)
-        return
+    if not broker_positions:
+        log("No live positions to manage.")
+        return state
 
-    blocked = symbols_with_exposure(api)
-    traded_today = set(state.get("traded_today", []))
-    candidates = candidates[
-        (~candidates["symbol"].isin(blocked)) &
-        (~candidates["symbol"].isin(traded_today))
-    ].copy()
-
-    if candidates.empty:
-        log("All candidates blocked by open exposure or same-day re-entry guard.")
-        summary["status"] = "all_candidates_blocked"
-        save_state(state)
-        write_summary(summary)
-        return
-
-    summary["scanner_candidates"] = int(len(candidates))
-    preview = candidates.head(8)[["symbol", "side", "score", "price", "rvol", "atr14"]].to_dict("records")
-    log(f"Scanner found {len(candidates)} candidates.")
-    log(f"Top candidates: {preview}")
-
-    available_slots = max(0, MAX_TOTAL_POSITIONS - len(open_positions))
-    max_orders = min(MAX_NEW_ORDERS_PER_RUN, available_slots)
-
-    submitted = 0
-    for _, row in candidates.iterrows():
-        if submitted >= max_orders:
-            break
-
-        symbol = row["symbol"]
-        side = row["side"]
-        price = safe_float(row["price"])
-        atr14 = safe_float(row["atr14"])
-
-        stop_price, target_price, stop_distance = compute_stop_target(price, atr14, side)
-        qty = compute_qty(equity, buying_power, price, stop_distance)
-
-        if qty <= 0:
-            log(f"Skipped {symbol} {side.upper()} | qty=0 price={price:.2f} stop_distance={stop_distance:.4f}")
+    for symbol, broker_pos in broker_positions.items():
+        tracked = tracked_positions.get(symbol)
+        if not tracked:
             continue
 
-        ok = place_bracket_order(
-            api=api,
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            entry_est=price,
-            stop_price=stop_price,
-            target_price=target_price,
-            state=state,
+        direction = tracked.get("direction")
+        qty = int(tracked.get("qty", broker_pos["qty"]))
+        entry_fill = safe_float(tracked.get("entry_price_fill"), 0.0)
+        stop_price = safe_float(tracked.get("stop_price"), 0.0)
+        target_price = safe_float(tracked.get("target_price"), 0.0)
+
+        current_price = get_latest_trade_price(symbol)
+        if current_price is None or current_price <= 0:
+            current_price = safe_float(broker_pos.get("current_price"), 0.0)
+        if current_price <= 0:
+            continue
+
+        reason = None
+        if direction == "long":
+            if current_price <= stop_price:
+                reason = "stop_hit"
+            elif current_price >= target_price:
+                reason = "target_hit"
+        else:
+            if current_price >= stop_price:
+                reason = "stop_hit"
+            elif current_price <= target_price:
+                reason = "target_hit"
+
+        if is_force_exit_time(current):
+            reason = "time_exit_1300"
+
+        if not reason:
+            continue
+
+        exit_result = submit_exit_order(symbol, qty, direction)
+        if not exit_result:
+            tracked["status"] = "exit_failed"
+            tracked_positions[symbol] = tracked
+            state["positions"] = tracked_positions
+            save_state(state)
+            continue
+
+        exit_fill = exit_result["fill_price"] if exit_result["fill_price"] is not None else current_price
+        pnl = compute_trade_pnl(direction, entry_fill, exit_fill, qty)
+
+        append_csv(
+            TRADES_LOG_FILE,
+            {
+                "timestamp_et": current.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": symbol,
+                "direction": direction,
+                "event": "exit_submitted",
+                "qty": qty,
+                "entry_order_id": tracked.get("entry_order_id", ""),
+                "entry_price_est": tracked.get("entry_price_est", ""),
+                "entry_price_fill": round(entry_fill, 4),
+                "stop_price": round(stop_price, 4),
+                "target_price": round(target_price, 4),
+                "exit_order_id": exit_result["order_id"],
+                "exit_price_est": round(current_price, 4),
+                "exit_price_fill": round(exit_fill, 4),
+                "reason": reason,
+                "gross_pnl": pnl["gross_pnl"],
+                "sec_fee": pnl["sec_fee"],
+                "net_pnl": pnl["net_pnl"],
+                "score": safe_float(tracked.get("score"), 0.0),
+                "relative_volume": safe_float(tracked.get("relative_volume"), 0.0),
+                "range_pct": safe_float(tracked.get("range_pct"), 0.0),
+                "spy_regime": tracked.get("spy_regime", ""),
+                "pattern_tags": tracked.get("pattern_tags", ""),
+            },
+            TRADE_COLUMNS,
         )
-        if ok:
-            submitted += 1
 
-    summary["new_orders_submitted"] = submitted
-    summary["traded_today_count"] = len(state.get("traded_today", []))
-    summary["status"] = "completed"
+        state["realized_net_pnl_today"] = round(
+            safe_float(state.get("realized_net_pnl_today"), 0.0) + pnl["net_pnl"],
+            4,
+        )
+        if pnl["net_pnl"] < 0:
+            state["losing_trades_today"] = int(state.get("losing_trades_today", 0)) + 1
 
-    save_state(state)
-    write_summary(summary)
-    log(f"Run complete | new_orders_submitted={submitted}")
+        tracked["status"] = "closed"
+        tracked["exit_order_id"] = exit_result["order_id"]
+        tracked["exit_price_fill"] = round(exit_fill, 4)
+        tracked["exit_reason"] = reason
+        tracked["closed_at_et"] = current.strftime("%Y-%m-%d %H:%M:%S")
+        tracked["gross_pnl"] = pnl["gross_pnl"]
+        tracked["sec_fee"] = pnl["sec_fee"]
+        tracked["net_pnl"] = pnl["net_pnl"]
+        tracked_positions[symbol] = tracked
+
+        state["positions"] = tracked_positions
+        state = update_kill_switch(state)
+        save_state(state)
+
+    return state
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def run_bot() -> None:
+    log("=== bot_phase95.py start ===")
+    ensure_dirs()
+
+    state = load_state()
+    state = reset_daily_state_if_needed(state)
+    pattern_stats = load_pattern_stats()
+
+    try:
+        equity = get_account_equity()
+        buying_power = get_buying_power()
+        log(f"Account snapshot | equity={equity:.2f} buying_power={buying_power:.2f}")
+        log(
+            f"Configured windows | entry={ENTRY_START_HOUR:02d}:{ENTRY_START_MINUTE:02d}-"
+            f"{ENTRY_END_HOUR:02d}:{ENTRY_END_MINUTE:02d} ET "
+            f"force_exit={FORCE_EXIT_HOUR:02d}:{FORCE_EXIT_MINUTE:02d} ET"
+        )
+
+        is_open, current, market_reason = market_is_open()
+        log(
+            f"Current ET time: {current.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"| PT {now_pacific().strftime('%H:%M:%S %Z')}"
+        )
+        log(f"Market check: is_open={is_open} reason={market_reason}")
+
+        if not is_open:
+            log("Market is closed. Exiting cleanly.")
+            return
+
+        state = maybe_manage_and_exit_positions(state)
+        pattern_stats = refresh_pattern_stats()
+
+        if is_entry_window(current):
+            state = maybe_enter_new_positions(state, pattern_stats)
+        else:
+            log("Outside entry window for new entries.")
+
+        save_state(state)
+        log(
+            f"Done. trades_today={state.get('trades_today', 0)} "
+            f"losing_trades_today={state.get('losing_trades_today', 0)} "
+            f"realized_net_pnl_today={state.get('realized_net_pnl_today', 0.0)} "
+            f"kill_switch={state.get('kill_switch', False)}"
+        )
+        log("=== bot_phase95.py end ===")
+
+    except Exception as e:
+        log(f"Fatal error: {e}")
+        traceback.print_exc()
+        save_state(state)
+        raise
 
 
 if __name__ == "__main__":
-    try:
-        run_bot()
-    except Exception as exc:
-        error_text = f"FATAL ERROR: {exc}\n{traceback.format_exc()}"
-        log(error_text)
-        write_summary(
-            {
-                "bot": BOT_NAME,
-                "utc_time": now_utc().isoformat(),
-                "et_time": now_et().isoformat(),
-                "pt_time": now_pt().isoformat(),
-                "status": "fatal_error",
-                "error": error_text,
-            }
-        )
-        raise
+    run_bot()
