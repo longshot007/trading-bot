@@ -1,4 +1,4 @@
-name: trading_phase95
+name: trading_phase97
 
 on:
   schedule:
@@ -28,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install alpaca-trade-api pandas numpy pytz
 
-      - name: Run bot_phase95
+      - name: Run bot_phase97
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
