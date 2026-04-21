@@ -1,4 +1,4 @@
-alpaca-trade-api==3.3.2
+alpaca-trade-api==3.2.0
 pandas==2.2.2
 numpy==1.26.4
 pytz==2024.1
