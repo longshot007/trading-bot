@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+
+import os
 import json
 import time
 from datetime import datetime, timedelta
@@ -15,27 +18,34 @@ DAILY_LOSS_LIMIT   = 20_000
 ENTRY_CUTOFF_PT    = (11, 0)
 TIMEZONE_PT        = pytz.timezone("US/Pacific")
 
-# GitHub Actions ephemeral runner — write to /tmp so paths always exist
 LOG_FILE           = "/tmp/bot97_log.json"
 STATE_FILE         = "/tmp/positions_state.json"
 
 WATCHLIST          = ["AAPL", "TSLA", "NVDA", "AMD", "SPY"]
 
+# ================= ENV VALIDATION =================
+REQUIRED_ENV = [
+    "APCA_API_KEY_ID",
+    "APCA_API_SECRET_KEY",
+    "APCA_API_BASE_URL",
+]
+
+missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
+if missing:
+    raise SystemExit(f"[FATAL] Missing environment variables: {', '.join(missing)}")
+
 # ================= API =================
-try:
-    api = tradeapi.REST(
-        os.environ["APCA_API_KEY_ID"],
-        os.environ["APCA_API_SECRET_KEY"],
-        os.environ["APCA_API_BASE_URL"],
-        api_version="v2"
-    )
-except KeyError as e:
-    raise SystemExit(f"[FATAL] Missing environment variable: {e}")
+api = tradeapi.REST(
+    os.environ["APCA_API_KEY_ID"],
+    os.environ["APCA_API_SECRET_KEY"],
+    os.environ["APCA_API_BASE_URL"],
+    api_version="v2"
+)
 
 # ================= LOGGING =================
 def log(data: dict):
     data["ts"] = datetime.utcnow().isoformat()
-    print(json.dumps(data), flush=True)          # stdout captured by Actions
+    print(json.dumps(data), flush=True)
     try:
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(data) + "\n")
@@ -88,7 +98,7 @@ def entry_allowed() -> bool:
 # ================= INDICATORS =================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
+    df["ema9"]  = df["close"].ewm(span=9, adjust=False).mean()
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
 
     delta = df["close"].diff()
@@ -107,9 +117,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ================= SIGNAL =================
 def get_signal(df: pd.DataFrame):
-    """Returns 'BUY', 'SELL', or None."""
     if len(df) < 20:
         return None
+
     r = df.iloc[-1]
     if pd.isna(r["rsi"]) or pd.isna(r["bb_upper"]):
         return None
@@ -127,7 +137,6 @@ def get_signal(df: pd.DataFrame):
     return None
 
 def quality_score(df: pd.DataFrame) -> float:
-    """Simple quality gate: 0.0–1.0. Requires score >= 0.5 to trade."""
     r = df.iloc[-1]
     score = 0
     score += int(r["ema9"] > r["ema20"])
@@ -138,30 +147,35 @@ def quality_score(df: pd.DataFrame) -> float:
 def position_size(equity: float, price: float) -> int:
     return max(0, int((equity * MAX_POSITION_PCT) // price))
 
-# ================= HOLD ENFORCEMENT =================
+# ================= HOLD =================
 def enforce_hold_limits(positions: dict, state: dict):
     now = datetime.utcnow()
     for symbol in list(positions):
         if symbol not in state:
             state[symbol] = {"entry": now.isoformat()}
+
         try:
             entry_dt = datetime.fromisoformat(state[symbol]["entry"])
-        except (KeyError, ValueError):
+        except:
             state[symbol] = {"entry": now.isoformat()}
             continue
 
         if (now - entry_dt).days >= MAX_HOLD_DAYS:
             qty  = abs(positions[symbol])
             side = "sell" if positions[symbol] > 0 else "buy"
+
             try:
                 api.submit_order(
-                    symbol=symbol, qty=qty, side=side,
-                    type="market", time_in_force="day"
+                    symbol=symbol,
+                    qty=qty,
+                    side=side,
+                    type="market",
+                    time_in_force="day"
                 )
-                log({"event": "FORCE_EXIT", "symbol": symbol,
-                     "held_days": (now - entry_dt).days})
+                log({"event": "FORCE_EXIT", "symbol": symbol})
             except Exception as e:
                 log({"event": "FORCE_EXIT_ERROR", "symbol": symbol, "err": str(e)})
+
             state.pop(symbol, None)
 
     save_state(state)
@@ -176,16 +190,22 @@ def check_kill_switch(positions: dict) -> bool:
 
     if unrealized <= -DAILY_LOSS_LIMIT:
         log({"event": "KILL_SWITCH", "unrealized_pl": unrealized})
+
         for symbol, qty in positions.items():
             side = "sell" if qty > 0 else "buy"
             try:
                 api.submit_order(
-                    symbol=symbol, qty=abs(qty), side=side,
-                    type="market", time_in_force="day"
+                    symbol=symbol,
+                    qty=abs(qty),
+                    side=side,
+                    type="market",
+                    time_in_force="day"
                 )
             except Exception as e:
                 log({"event": "LIQUIDATE_ERROR", "symbol": symbol, "err": str(e)})
+
         return True
+
     return False
 
 # ================= MAIN =================
@@ -205,12 +225,8 @@ def run():
 
     log({"event": "ACCOUNT", "equity": equity, "buying_power": bp})
 
-    try:
-        positions   = get_positions()
-        open_orders = get_open_orders()
-    except Exception as e:
-        log({"event": "POSITIONS_ERROR", "err": str(e)})
-        return
+    positions   = get_positions()
+    open_orders = get_open_orders()
 
     if check_kill_switch(positions):
         return
@@ -218,7 +234,6 @@ def run():
     state = load_state()
     enforce_hold_limits(positions, state)
 
-    # Refresh after hold exits
     positions   = get_positions()
     open_orders = get_open_orders()
 
@@ -229,7 +244,6 @@ def run():
 
     for symbol in WATCHLIST:
         if symbol in positions or symbol in open_orders:
-            log({"event": "SKIP", "symbol": symbol, "reason": "already_held_or_ordered"})
             continue
 
         try:
@@ -239,52 +253,44 @@ def run():
             continue
 
         if bars.empty or len(bars) < 20:
-            log({"event": "SKIP", "symbol": symbol, "reason": "insufficient_data"})
             continue
 
         df  = add_indicators(bars)
         sig = get_signal(df)
 
         if not sig:
-            log({"event": "NO_SIGNAL", "symbol": symbol})
             continue
 
         if quality_score(df) < 0.5:
-            log({"event": "REJECT", "symbol": symbol, "reason": "quality_gate"})
             continue
 
         price = float(df["close"].iloc[-1])
         qty   = position_size(equity, price)
 
         if qty <= 0:
-            log({"event": "SKIP", "symbol": symbol, "reason": "qty_zero"})
             continue
 
-        order_value = qty * price
-        if order_value > equity * BUYING_POWER_CAP:
-            log({"event": "SKIP", "symbol": symbol,
-                 "reason": "buying_power_cap", "order_value": order_value})
+        if qty * price > equity * BUYING_POWER_CAP:
             continue
 
         side = "buy" if sig == "BUY" else "sell"
+
         try:
             api.submit_order(
-                symbol=symbol, qty=qty, side=side,
-                type="market", time_in_force="day"
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type="market",
+                time_in_force="day"
             )
-            log({"event": "ORDER", "symbol": symbol, "side": side,
-                 "qty": qty, "price": price, "value": order_value})
+
+            log({"event": "ORDER", "symbol": symbol, "side": side, "qty": qty})
+
             state[symbol] = {"entry": datetime.utcnow().isoformat()}
             save_state(state)
+
         except Exception as e:
             log({"event": "ORDER_ERROR", "symbol": symbol, "err": str(e)})
-
-        # Refresh account after each order
-        try:
-            equity, bp = get_account()
-        except Exception as e:
-            log({"event": "ACCOUNT_REFRESH_ERROR", "err": str(e)})
-            break
 
     log({"event": "RUN_END"})
 
