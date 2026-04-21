@@ -2,12 +2,23 @@ name: trading_phase97
 
 on:
   schedule:
-    # 9:30, 9:40, 9:50 ET (13:30, 13:40, 13:50 UTC during DST)
+    # ── DST (2nd Sun Mar → 1st Sun Nov) ET = UTC−4 ──────────────────────────
+    # 9:30–9:50 ET open burst
     - cron: "30,40,50 13 * * 1-5"
-    # 10:00–12:50 ET every 10 minutes (14:00–16:50 UTC during DST)
+    # 10:00–12:50 ET every 10 min
     - cron: "0,10,20,30,40,50 14-16 * * 1-5"
-    # 1:00 ET final management / forced-flat run (17:00 UTC during DST)
+    # 13:00 ET forced-flat / final management
     - cron: "0 17 * * 1-5"
+
+    # ── Standard time (1st Sun Nov → 2nd Sun Mar) ET = UTC−5 ────────────────
+    # 9:30–9:50 ET open burst
+    - cron: "30,40,50 14 * * 1-5"
+    # 10:00–12:50 ET every 10 min
+    - cron: "0,10,20,30,40,50 15-17 * * 1-5"
+    # 13:00 ET forced-flat / final management
+    - cron: "0 18 * * 1-5"
+
+  # Manual trigger — use this to confirm the workflow is still enabled
   workflow_dispatch:
 
 jobs:
@@ -23,14 +34,32 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Cache pip to speed up cold starts (~60s saved per run)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install alpaca-trade-api pandas numpy pytz
+          pip install -r requirements.txt
 
-      - name: Run bot_phase97
+      - name: Run bot
         env:
-          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_KEY_ID:     ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
-          APCA_API_BASE_URL: ${{ secrets.APCA_API_BASE_URL }}
+          APCA_API_BASE_URL:   ${{ secrets.APCA_API_BASE_URL }}
         run: python bot_phase97.py
+
+      # Upload log as artifact so you can download it after each run
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-log-${{ github.run_id }}
+          path: /tmp/bot97_log.json
+          if-no-files-found: ignore
+          retention-days: 30
