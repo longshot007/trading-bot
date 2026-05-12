@@ -15,3 +15,5 @@
 {"event": "SCAN_START", "ts": "2026-05-12T16:37:11.455729"}
 {"event": "CANDIDATES", "count": 0, "ts": "2026-05-12T16:38:14.555633"}
 {"event": "RUN_END", "ts": "2026-05-12T16:38:14.555969"}
+{"event": "RUN_START", "ts": "2026-05-12T17:02:51.394815"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-05-12T17:02:51.784669"}
