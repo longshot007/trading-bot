@@ -1,2 +1,7 @@
 {"event": "RUN_START", "ts": "2026-05-12T08:10:52.841325"}
 {"event": "MARKET_CLOSED", "ts": "2026-05-12T08:10:52.922072"}
+{"event": "RUN_START", "ts": "2026-05-12T16:02:09.163145"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-05-12T16:02:09.278280"}
+{"event": "SCAN_START", "ts": "2026-05-12T16:02:09.328782"}
+{"event": "CANDIDATES", "count": 0, "ts": "2026-05-12T16:03:11.084632"}
+{"event": "RUN_END", "ts": "2026-05-12T16:03:11.084990"}
