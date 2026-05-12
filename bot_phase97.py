@@ -1,78 +1,100 @@
 #!/usr/bin/env python3
 
 """
-Institutional-Style Alpaca Momentum Bot
----------------------------------------
+Institutional-Style Alpaca Momentum Bot (Phase 97)
+---------------------------------------------------
 
 Key Features:
 - Long-only architecture
 - Hidden/internal stop losses (NOT sent to broker)
-- ATR volatility-adjusted sizing
-- Multi-stage filtering pipeline
-- Timed exits
+- ATR volatility-adjusted sizing, scaled by confluence score
+- Candlestick pattern detection via candlestick_rules.py
+- Tiered entry windows with escalating confluence requirements
+- Weak-position forced-flat at 3:30–3:45 PM ET
 - Daily loss circuit breaker
 - SEC fee accounting
-- Persistent state management
-- Cooldown system
-- Portfolio exposure control
-- Structured logging for future ML training
+- Persistent state committed back to GitHub after each run
+- Position reconciliation against live Alpaca state on startup
+- Structured JSON logging to logs/ directory
 
 WARNING:
-This is still a trading system and carries real financial risk.
 Paper trade extensively before production deployment.
 """
 
 import os
 import json
-import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytz
 import numpy as np
 import pandas as pd
-import alpaca_trade_api as tradeapi
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, AssetStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+from candlestick_rules import (
+    detect_signals,
+    confluence_score,
+    market_structure,
+    CandlestickRules,
+)
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-MAX_POSITION_RISK_PCT     = 0.005      # 0.5% account risk per trade
-MAX_TOTAL_EXPOSURE_PCT    = 0.25       # 25% deployed capital max
-MAX_TRADES_PER_RUN        = 3
+MAX_POSITION_RISK_PCT   = 0.005       # 0.5% account risk per trade
+MAX_TOTAL_EXPOSURE_PCT  = 0.25        # 25% deployed capital max
+MAX_TRADES_PER_RUN      = 3
 
-MIN_PRICE                 = 5
-MIN_DOLLAR_VOLUME         = 2_000_000
-MIN_AVG_VOLUME            = 200_000
+MIN_PRICE               = 5
+MIN_DOLLAR_VOLUME       = 2_000_000
+MIN_AVG_VOLUME          = 200_000
+MIN_POSITION_DOLLARS    = 100         # skip if qty * price < this
 
-ATR_STOP_MULTIPLIER       = 1.8
-TAKE_PROFIT_MULTIPLIER    = 2.5
+ATR_STOP_MULTIPLIER     = 1.8
+TAKE_PROFIT_MULTIPLIER  = 2.5
 
-MAX_HOLD_DAYS             = 4
+MAX_HOLD_DAYS           = 4
 
-DAILY_LOSS_LIMIT          = 20_000
+DAILY_LOSS_LIMIT        = 20_000
 
-MAX_SPREAD_PCT            = 0.0035
+MAX_SPREAD_PCT          = 0.0035
 
-COOLDOWN_MINUTES          = 60
+COOLDOWN_MINUTES        = 60
 
-SEC_FEE_RATE              = 0.0000206
+SEC_FEE_RATE            = 0.0000206
 
-TIMEZONE_ET               = pytz.timezone("US/Eastern")
+CONFLUENCE_MIN_FULL     = 3           # required score 9:30–11:30 ET
+CONFLUENCE_MIN_LATE     = 4           # required score 11:30–13:00 ET
+WEAK_FAVOR_PCT          = 0.005       # 0.5% — below this is a weak position
 
-LOG_FILE                  = "/tmp/institutional_bot_log.json"
-STATE_FILE                = "/tmp/institutional_bot_state.json"
+TIMEZONE_ET             = pytz.timezone("US/Eastern")
+
+LOG_DIR                 = "logs"
+STATE_FILE              = os.path.join("state", "bot_state.json")
 
 
 # =========================================================
-# API
+# API CLIENTS
 # =========================================================
 
-api = tradeapi.REST(
+_base_url = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+_is_paper = "paper" in _base_url.lower()
+
+trading_client = TradingClient(
     os.environ["APCA_API_KEY_ID"],
     os.environ["APCA_API_SECRET_KEY"],
-    os.environ["APCA_API_BASE_URL"],
-    api_version="v2"
+    paper=_is_paper,
+)
+
+data_client = StockHistoricalDataClient(
+    os.environ["APCA_API_KEY_ID"],
+    os.environ["APCA_API_SECRET_KEY"],
 )
 
 
@@ -80,13 +102,15 @@ api = tradeapi.REST(
 # LOGGING
 # =========================================================
 
+_log_file = os.path.join(LOG_DIR, f"bot_{datetime.utcnow().strftime('%Y%m%d')}.json")
+
+
 def log(data):
     data["ts"] = datetime.utcnow().isoformat()
-
     print(json.dumps(data), flush=True)
-
     try:
-        with open(LOG_FILE, "a") as f:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(_log_file, "a") as f:
             f.write(json.dumps(data) + "\n")
     except Exception:
         pass
@@ -97,26 +121,17 @@ def log(data):
 # =========================================================
 
 def load_state():
-
     if not os.path.exists(STATE_FILE):
-        return {
-            "positions": {},
-            "closed_pnl_today": 0,
-            "cooldowns": {}
-        }
-
+        return {"positions": {}, "closed_pnl_today": 0, "cooldowns": {}}
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {
-            "positions": {},
-            "closed_pnl_today": 0,
-            "cooldowns": {}
-        }
+        return {"positions": {}, "closed_pnl_today": 0, "cooldowns": {}}
 
 
 def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -130,14 +145,24 @@ def now_et():
 
 
 def market_is_open():
-    return api.get_clock().is_open
+    return trading_client.get_clock().is_open
 
 
-def entry_window():
-
+def trading_window():
     t = now_et()
-
-    return (9, 35) <= (t.hour, t.minute) <= (14, 0)
+    hm = (t.hour, t.minute)
+    if (9, 30) <= hm < (11, 30):
+        return "FULL"
+    elif (11, 30) <= hm < (13, 0):
+        return "CONFLUENCE"
+    elif (13, 0) <= hm < (15, 30):
+        return "EXITS_ONLY"
+    elif (15, 30) <= hm < (15, 45):
+        return "WEAK_CLOSE"
+    elif (15, 45) <= hm < (16, 0):
+        return "EXITS_ONLY"
+    else:
+        return "CLOSED"
 
 
 # =========================================================
@@ -145,29 +170,59 @@ def entry_window():
 # =========================================================
 
 def get_account():
-
-    acct = api.get_account()
-
+    acct = trading_client.get_account()
     return {
-        "equity": float(acct.equity),
-        "buying_power": float(acct.buying_power)
+        "equity":       float(acct.equity),
+        "buying_power": float(acct.buying_power),
     }
 
 
 def get_live_positions():
-
     out = {}
-
-    for p in api.list_positions():
-
+    for p in trading_client.get_all_positions():
         out[p.symbol] = {
-            "qty": float(p.qty),
-            "market_value": float(p.market_value),
+            "qty":             float(p.qty),
+            "market_value":    float(p.market_value),
             "avg_entry_price": float(p.avg_entry_price),
-            "unrealized_pl": float(p.unrealized_pl)
+            "unrealized_pl":   float(p.unrealized_pl),
         }
-
     return out
+
+
+# =========================================================
+# POSITION RECONCILIATION
+# =========================================================
+
+def reconcile_positions(state):
+    live = get_live_positions()
+
+    for symbol in list(state["positions"].keys()):
+        if symbol not in live:
+            log({"event": "RECONCILE_REMOVE", "symbol": symbol, "reason": "not_in_alpaca"})
+            del state["positions"][symbol]
+
+    for symbol, pos in live.items():
+        if symbol not in state["positions"]:
+            entry_price = pos["avg_entry_price"]
+            bars = get_bars(symbol)
+            if bars is not None:
+                df = add_indicators(bars)
+                atr = float(df["atr"].iloc[-1])
+                if np.isnan(atr) or atr <= 0:
+                    atr = entry_price * 0.02
+            else:
+                atr = entry_price * 0.02
+            state["positions"][symbol] = {
+                "entry_price":  entry_price,
+                "entry_open":   entry_price,
+                "stop_price":   entry_price - (atr * ATR_STOP_MULTIPLIER),
+                "target_price": entry_price + (atr * TAKE_PROFIT_MULTIPLIER),
+                "qty":          pos["qty"],
+                "entry_time":   now_et().isoformat(),
+            }
+            log({"event": "RECONCILE_ADD", "symbol": symbol, "entry": entry_price})
+
+    return state
 
 
 # =========================================================
@@ -175,27 +230,20 @@ def get_live_positions():
 # =========================================================
 
 def get_universe():
-
     log({"event": "SCAN_START"})
-
     try:
-        assets = api.list_assets(status="active")
+        request = GetAssetsRequest(
+            asset_class=AssetClass.US_EQUITY,
+            status=AssetStatus.ACTIVE,
+        )
+        assets = trading_client.get_all_assets(request)
     except Exception as e:
         log({"event": "SCAN_FAIL", "error": str(e)})
         return []
-
-    symbols = []
-
-    for a in assets:
-
-        if not a.tradable:
-            continue
-
-        if "." in a.symbol:
-            continue
-
-        symbols.append(a.symbol)
-
+    symbols = [
+        a.symbol for a in assets
+        if a.tradable and "." not in a.symbol
+    ]
     return symbols[:400]
 
 
@@ -204,57 +252,47 @@ def get_universe():
 # =========================================================
 
 def get_bars(symbol):
-
     try:
-
-        bars = api.get_bars(
-            symbol,
-            "1Min",
-            limit=120
-        ).df
-
-        if bars.empty or len(bars) < 60:
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=datetime.now(timezone.utc) - timedelta(hours=5),
+            limit=120,
+        )
+        bars = data_client.get_stock_bars(request)
+        df = bars.df
+        if isinstance(df.index, pd.MultiIndex):
+            if symbol not in df.index.get_level_values(0):
+                return None
+            df = df.loc[symbol]
+        if df.empty or len(df) < 60:
             return None
-
-        return bars
-
+        return df
     except Exception:
         return None
 
 
 # =========================================================
-# INDICATORS
+# INDICATORS  (ATR + avg_volume still needed here)
 # =========================================================
 
 def add_indicators(df):
-
     df = df.copy()
-
-    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema9"]  = df["close"].ewm(span=9).mean()
     df["ema20"] = df["close"].ewm(span=20).mean()
-
-    delta = df["close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
+    delta    = df["close"].diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/14).mean()
     avg_loss = loss.ewm(alpha=1/14).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
-
     tr1 = df["high"] - df["low"]
     tr2 = abs(df["high"] - df["close"].shift())
-    tr3 = abs(df["low"] - df["close"].shift())
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    df["atr"] = tr.rolling(14).mean()
-
+    tr3 = abs(df["low"]  - df["close"].shift())
+    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"]        = tr.rolling(14).mean()
     df["avg_volume"] = df["volume"].rolling(20).mean()
-
     return df
 
 
@@ -263,83 +301,33 @@ def add_indicators(df):
 # =========================================================
 
 def passes_filters(df):
-
-    r = df.iloc[-1]
-
-    price = float(r["close"])
+    r          = df.iloc[-1]
+    price      = float(r["close"])
+    avg_volume = float(df["avg_volume"].iloc[-1])
 
     if price < MIN_PRICE:
         return False
-
-    avg_volume = float(df["avg_volume"].iloc[-1])
-
-    if avg_volume < MIN_AVG_VOLUME:
+    if pd.isna(avg_volume) or avg_volume < MIN_AVG_VOLUME:
         return False
-
-    dollar_volume = avg_volume * price
-
-    if dollar_volume < MIN_DOLLAR_VOLUME:
+    if avg_volume * price < MIN_DOLLAR_VOLUME:
         return False
-
-    spread_pct = (r["high"] - r["low"]) / price
-
-    if spread_pct > MAX_SPREAD_PCT:
+    if (r["high"] - r["low"]) / price > MAX_SPREAD_PCT:
         return False
-
     return True
-
-
-# =========================================================
-# SIGNALS
-# =========================================================
-
-def generate_signal(df):
-
-    r = df.iloc[-1]
-
-    volume_confirmed = (
-        r["volume"] >
-        df["volume"].rolling(20).mean().iloc[-1]
-    )
-
-    trend_confirmed = (
-        r["ema9"] > r["ema20"]
-    )
-
-    momentum_confirmed = (
-        55 < r["rsi"] < 75
-    )
-
-    if (
-        trend_confirmed and
-        momentum_confirmed and
-        volume_confirmed
-    ):
-        return "BUY"
-
-    return None
 
 
 # =========================================================
 # RISK
 # =========================================================
 
-def calculate_position_size(
-    equity,
-    entry_price,
-    stop_price
-):
-
+def calculate_position_size(equity, entry_price, stop_price):
     risk_per_share = abs(entry_price - stop_price)
-
     if risk_per_share <= 0:
         return 0
-
-    dollar_risk = equity * MAX_POSITION_RISK_PCT
-
-    shares = int(dollar_risk / risk_per_share)
-
-    return max(shares, 0)
+    shares = int((equity * MAX_POSITION_RISK_PCT) / risk_per_share)
+    if shares * entry_price < MIN_POSITION_DOLLARS:
+        return 0
+    return shares
 
 
 # =========================================================
@@ -347,68 +335,34 @@ def calculate_position_size(
 # =========================================================
 
 def submit_buy(symbol, qty):
-
     try:
-
-        api.submit_order(
+        trading_client.submit_order(MarketOrderRequest(
             symbol=symbol,
             qty=qty,
-            side="buy",
-            type="market",
-            time_in_force="day"
-        )
-
-        log({
-            "event": "BUY_ORDER",
-            "symbol": symbol,
-            "qty": qty
-        })
-
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+        ))
+        log({"event": "BUY_ORDER", "symbol": symbol, "qty": qty})
         return True
-
     except Exception as e:
-
-        log({
-            "event": "BUY_FAIL",
-            "symbol": symbol,
-            "error": str(e)
-        })
-
+        log({"event": "BUY_FAIL", "symbol": symbol, "error": str(e)})
         return False
 
 
 def submit_sell(symbol, qty, reason, est_price):
-
     try:
-
-        api.submit_order(
+        trading_client.submit_order(MarketOrderRequest(
             symbol=symbol,
             qty=qty,
-            side="sell",
-            type="market",
-            time_in_force="day"
-        )
-
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        ))
         sec_fee = qty * est_price * SEC_FEE_RATE
-
-        log({
-            "event": "SELL_ORDER",
-            "symbol": symbol,
-            "qty": qty,
-            "reason": reason,
-            "sec_fee": sec_fee
-        })
-
+        log({"event": "SELL_ORDER", "symbol": symbol, "qty": qty,
+             "reason": reason, "sec_fee": sec_fee})
         return sec_fee
-
     except Exception as e:
-
-        log({
-            "event": "SELL_FAIL",
-            "symbol": symbol,
-            "error": str(e)
-        })
-
+        log({"event": "SELL_FAIL", "symbol": symbol, "error": str(e)})
         return 0
 
 
@@ -417,75 +371,86 @@ def submit_sell(symbol, qty, reason, est_price):
 # =========================================================
 
 def manage_positions(state):
-
     live_positions = get_live_positions()
 
     for symbol, meta in list(state["positions"].items()):
-
         if symbol not in live_positions:
             continue
 
-        qty = live_positions[symbol]["qty"]
-
-        bars = get_bars(symbol)
-
+        qty          = live_positions[symbol]["qty"]
+        bars         = get_bars(symbol)
         if bars is None:
             continue
 
-        price = float(bars["close"].iloc[-1])
-
-        entry_price = meta["entry_price"]
-
-        stop_price = meta["stop_price"]
-
+        df           = add_indicators(bars)
+        price        = float(df["close"].iloc[-1])
+        entry_price  = meta["entry_price"]
+        stop_price   = meta["stop_price"]
         target_price = meta["target_price"]
+        entry_time   = datetime.fromisoformat(meta["entry_time"])
+        age          = now_et() - entry_time
+        exit_reason  = None
 
-        entry_time = datetime.fromisoformat(meta["entry_time"])
-
-        age = now_et() - entry_time
-
-        exit_reason = None
-
-        # hidden stop
-        if price <= stop_price:
+        # candlestick exit signals take priority
+        entry_open = meta.get("entry_open", entry_price)
+        should_exit, cs_reason = CandlestickRules.check_exit(
+            df, entry_open, entry_price, stop_price, price
+        )
+        if should_exit:
+            exit_reason = cs_reason
+        elif price <= stop_price:
             exit_reason = "STOP"
-
-        # take profit
         elif price >= target_price:
             exit_reason = "TARGET"
-
-        # timed exit
         elif age > timedelta(days=MAX_HOLD_DAYS):
             exit_reason = "TIME_EXIT"
 
         if exit_reason:
-
-            sec_fee = submit_sell(
-                symbol,
-                qty,
-                exit_reason,
-                price
-            )
-
-            pnl = (
-                (price - entry_price) * qty
-            ) - sec_fee
-
+            sec_fee = submit_sell(symbol, qty, exit_reason, price)
+            pnl = ((price - entry_price) * qty) - sec_fee
             state["closed_pnl_today"] += pnl
-
             del state["positions"][symbol]
-
             state["cooldowns"][symbol] = (
-                now_et() + timedelta(
-                    minutes=COOLDOWN_MINUTES
-                )
+                now_et() + timedelta(minutes=COOLDOWN_MINUTES)
             ).isoformat()
+            log({"event": "POSITION_EXIT", "symbol": symbol,
+                 "reason": exit_reason, "pnl": pnl})
 
+
+# =========================================================
+# WEAK POSITION CLOSE  (3:30–3:45 PM ET)
+# =========================================================
+
+def close_weak_positions(state):
+    live_positions = get_live_positions()
+
+    for symbol, meta in list(state["positions"].items()):
+        if symbol not in live_positions:
+            continue
+
+        pos           = live_positions[symbol]
+        qty           = pos["qty"]
+        unrealized_pl = pos["unrealized_pl"]
+        entry_price   = meta["entry_price"]
+        current_price = pos["market_value"] / qty if qty > 0 else entry_price
+        favor_pct     = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+
+        is_weak = unrealized_pl < 0 or favor_pct < WEAK_FAVOR_PCT
+
+        if is_weak:
+            sec_fee = submit_sell(symbol, qty, "WEAK_CLOSE_EOD", current_price)
+            pnl = ((current_price - entry_price) * qty) - sec_fee
+            state["closed_pnl_today"] += pnl
+            del state["positions"][symbol]
+            state["cooldowns"][symbol] = (
+                now_et() + timedelta(minutes=COOLDOWN_MINUTES)
+            ).isoformat()
             log({
-                "event": "POSITION_EXIT",
-                "symbol": symbol,
-                "reason": exit_reason,
-                "pnl": pnl
+                "event":      "WEAK_POSITION_CLOSED",
+                "symbol":     symbol,
+                "pnl":        pnl,
+                "favor_pct":  round(favor_pct, 5),
+                "unrealized": unrealized_pl,
             })
 
 
@@ -494,16 +459,9 @@ def manage_positions(state):
 # =========================================================
 
 def risk_circuit_breaker(state):
-
     if state["closed_pnl_today"] <= -DAILY_LOSS_LIMIT:
-
-        log({
-            "event": "DAILY_STOP_TRIGGERED",
-            "loss": state["closed_pnl_today"]
-        })
-
+        log({"event": "DAILY_STOP_TRIGGERED", "loss": state["closed_pnl_today"]})
         return True
-
     return False
 
 
@@ -512,164 +470,134 @@ def risk_circuit_breaker(state):
 # =========================================================
 
 def run():
-
     log({"event": "RUN_START"})
 
     if not market_is_open():
-
         log({"event": "MARKET_CLOSED"})
         return
 
     state = load_state()
+    state = reconcile_positions(state)
 
     manage_positions(state)
 
     if risk_circuit_breaker(state):
-
         save_state(state)
         return
 
-    if not entry_window():
+    window = trading_window()
+    log({"event": "TRADING_WINDOW", "window": window})
 
+    if window == "WEAK_CLOSE":
+        close_weak_positions(state)
+        manage_positions(state)
         save_state(state)
-
-        log({"event": "OUTSIDE_ENTRY_WINDOW"})
         return
 
-    acct = get_account()
+    if window in ("EXITS_ONLY", "CLOSED"):
+        save_state(state)
+        return
 
-    equity = acct["equity"]
+    # ── Entry phase: FULL or CONFLUENCE ──────────────────
+    confluence_min = CONFLUENCE_MIN_FULL if window == "FULL" else CONFLUENCE_MIN_LATE
 
-    live_positions = get_live_positions()
+    acct             = get_account()
+    equity           = acct["equity"]
+    live_positions   = get_live_positions()
+    current_exposure = sum(p["market_value"] for p in live_positions.values())
 
-    current_exposure = sum(
-        p["market_value"]
-        for p in live_positions.values()
-    )
-
-    if (
-        current_exposure >=
-        equity * MAX_TOTAL_EXPOSURE_PCT
-    ):
-
+    if current_exposure >= equity * MAX_TOTAL_EXPOSURE_PCT:
         log({"event": "MAX_EXPOSURE_REACHED"})
-
         save_state(state)
         return
 
-    universe = get_universe()
-
+    universe   = get_universe()
     candidates = []
 
     for symbol in universe:
-
         if symbol in live_positions:
             continue
 
         cooldown = state["cooldowns"].get(symbol)
-
-        if cooldown:
-
-            if now_et() < datetime.fromisoformat(cooldown):
-                continue
+        if cooldown and now_et() < datetime.fromisoformat(cooldown):
+            continue
 
         bars = get_bars(symbol)
-
         if bars is None:
             continue
 
         df = add_indicators(bars)
-
         if not passes_filters(df):
             continue
 
-        signal = generate_signal(df)
-
-        if signal != "BUY":
+        signals      = detect_signals(df)
+        bull_signals = {k: v for k, v in signals.items()
+                        if v["direction"] in ("bull", "neutral")}
+        if not bull_signals:
             continue
 
-        candidates.append((symbol, df))
+        score, _ = confluence_score(df, "bull")
+        if score < confluence_min:
+            continue
 
-    log({
-        "event": "CANDIDATES",
-        "count": len(candidates)
-    })
+        if market_structure(df) == "choppy":
+            continue
 
-    for symbol, df in candidates[:MAX_TRADES_PER_RUN]:
+        candidates.append((symbol, df, score))
 
-        r = df.iloc[-1]
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    log({"event": "CANDIDATES", "count": len(candidates)})
 
+    for symbol, df, score in candidates[:MAX_TRADES_PER_RUN]:
+        r           = df.iloc[-1]
         entry_price = float(r["close"])
-
-        atr = float(r["atr"])
+        entry_open  = float(r["open"])
+        atr         = float(r["atr"])
 
         if np.isnan(atr) or atr <= 0:
             continue
 
-        stop_price = (
-            entry_price -
-            (atr * ATR_STOP_MULTIPLIER)
-        )
+        stop_price   = entry_price - (atr * ATR_STOP_MULTIPLIER)
+        target_price = entry_price + (atr * TAKE_PROFIT_MULTIPLIER)
 
-        target_price = (
-            entry_price +
-            (
-                atr *
-                TAKE_PROFIT_MULTIPLIER
-            )
-        )
-
-        qty = calculate_position_size(
-            equity,
-            entry_price,
-            stop_price
-        )
+        size_factor = CandlestickRules.position_size_factor(score)
+        qty         = int(calculate_position_size(equity, entry_price, stop_price) * size_factor)
 
         if qty <= 0:
             continue
 
         estimated_cost = qty * entry_price
-
-        if (
-            current_exposure +
-            estimated_cost
-        ) > (
-            equity *
-            MAX_TOTAL_EXPOSURE_PCT
-        ):
+        if current_exposure + estimated_cost > equity * MAX_TOTAL_EXPOSURE_PCT:
             continue
 
         ok = submit_buy(symbol, qty)
-
         if not ok:
             continue
 
         state["positions"][symbol] = {
-
-            "entry_price": entry_price,
-
-            "stop_price": stop_price,
-
+            "entry_price":  entry_price,
+            "entry_open":   entry_open,
+            "stop_price":   stop_price,
             "target_price": target_price,
-
-            "qty": qty,
-
-            "entry_time": now_et().isoformat()
+            "qty":          qty,
+            "entry_time":   now_et().isoformat(),
         }
 
         current_exposure += estimated_cost
 
         log({
-            "event": "POSITION_OPENED",
-            "symbol": symbol,
-            "entry": entry_price,
-            "stop": stop_price,
-            "target": target_price,
-            "qty": qty
+            "event":       "POSITION_OPENED",
+            "symbol":      symbol,
+            "entry":       entry_price,
+            "stop":        stop_price,
+            "target":      target_price,
+            "qty":         qty,
+            "score":       score,
+            "size_factor": size_factor,
+            "window":      window,
         })
 
     save_state(state)
-
     log({"event": "RUN_END"})
 
 
@@ -678,5 +606,4 @@ def run():
 # =========================================================
 
 if __name__ == "__main__":
-
     run()

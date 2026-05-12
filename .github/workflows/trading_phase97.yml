@@ -5,21 +5,24 @@ on:
     # ── DST (2nd Sun Mar → 1st Sun Nov) ET = UTC−4 ──────────────────────────
     # 9:30–9:50 ET open burst
     - cron: "30,40,50 13 * * 1-5"
-    # 10:00–12:50 ET every 10 min
-    - cron: "0,10,20,30,40,50 14-16 * * 1-5"
-    # 13:00 ET forced-flat / final management
-    - cron: "0 17 * * 1-5"
+    # 10:00–15:50 ET every 10 min
+    - cron: "0,10,20,30,40,50 14-19 * * 1-5"
+    # 16:00 ET final management
+    - cron: "0 20 * * 1-5"
 
     # ── Standard time (1st Sun Nov → 2nd Sun Mar) ET = UTC−5 ────────────────
     # 9:30–9:50 ET open burst
     - cron: "30,40,50 14 * * 1-5"
-    # 10:00–12:50 ET every 10 min
-    - cron: "0,10,20,30,40,50 15-17 * * 1-5"
-    # 13:00 ET forced-flat / final management
-    - cron: "0 18 * * 1-5"
+    # 10:00–15:50 ET every 10 min
+    - cron: "0,10,20,30,40,50 15-20 * * 1-5"
+    # 16:00 ET final management
+    - cron: "0 21 * * 1-5"
 
   # Manual trigger — use this to confirm the workflow is still enabled
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-bot:
@@ -28,6 +31,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,12 +59,25 @@ jobs:
           APCA_API_BASE_URL:   ${{ secrets.APCA_API_BASE_URL }}
         run: python bot_phase97.py
 
-      # Upload log as artifact so you can download it after each run
+      # Commit state and logs back to the repo so they persist across runs
+      - name: Commit state and logs
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/ logs/
+          git diff --cached --quiet || (
+            git commit -m "bot: $(date -u +%Y-%m-%dT%H:%M:%SZ)" &&
+            git pull --rebase origin main &&
+            git push origin main
+          )
+
+      # Also upload today's log as a downloadable artifact
       - name: Upload run log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bot-log-${{ github.run_id }}
-          path: /tmp/bot97_log.json
+          path: logs/bot_*.json
           if-no-files-found: ignore
           retention-days: 30
