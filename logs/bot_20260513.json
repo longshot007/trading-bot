@@ -3,3 +3,8 @@
 {"event": "SCAN_START", "ts": "2026-05-13T16:01:55.684443"}
 {"event": "CANDIDATES", "count": 0, "ts": "2026-05-13T16:02:59.185730"}
 {"event": "RUN_END", "ts": "2026-05-13T16:02:59.186105"}
+{"event": "RUN_START", "ts": "2026-05-13T16:12:39.434383"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-05-13T16:12:39.559012"}
+{"event": "SCAN_START", "ts": "2026-05-13T16:12:39.603115"}
+{"event": "CANDIDATES", "count": 0, "ts": "2026-05-13T16:13:42.196332"}
+{"event": "RUN_END", "ts": "2026-05-13T16:13:42.196693"}
