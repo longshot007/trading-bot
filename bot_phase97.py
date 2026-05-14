@@ -495,9 +495,15 @@ def close_weak_positions(state):
 # DAILY RISK CONTROL
 # =========================================================
 
-def risk_circuit_breaker(state):
-    if state["closed_pnl_today"] <= -DAILY_LOSS_LIMIT:
-        log({"event": "DAILY_STOP_TRIGGERED", "loss": state["closed_pnl_today"]})
+def risk_circuit_breaker():
+    current_state = load_state()
+    closed_pnl_today = current_state.get("closed_pnl_today", 0.0)
+    if closed_pnl_today <= -DAILY_LOSS_LIMIT:
+        if not current_state.get("circuit_breaker_tripped", False):
+            current_state["circuit_breaker_tripped"] = True
+            current_state["tripped_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_state(current_state)
+            log({"event": "CIRCUIT_BREAKER_TRIPPED", "loss": closed_pnl_today, "limit": -DAILY_LOSS_LIMIT})
         return True
     return False
 
@@ -518,7 +524,7 @@ def run():
 
     manage_positions(state)
 
-    if risk_circuit_breaker(state):
+    if risk_circuit_breaker():
         save_state(state)
         return
 
