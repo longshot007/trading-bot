@@ -49,7 +49,8 @@ from candlestick_rules import (
 
 MAX_POSITION_RISK_PCT   = 0.005       # 0.5% account risk per trade
 MAX_TOTAL_EXPOSURE_PCT  = 0.25        # 25% deployed capital max
-MAX_TRADES_PER_RUN      = 3
+MAX_TRADES_PER_RUN      = 999         # effectively unlimited - exposure limit is the real cap
+UNIVERSE_SIZE           = 1500        # was 400; scan broader market for setups
 
 MIN_PRICE               = 5
 MIN_DOLLAR_VOLUME       = 2_000_000
@@ -242,9 +243,14 @@ def get_universe():
         return []
     symbols = [
         a.symbol for a in assets
-        if a.tradable and "." not in a.symbol
+        if a.tradable
+        and a.fractionable
+        and "." not in a.symbol
+        and "/" not in a.symbol
+        and len(a.symbol) <= 5
     ]
-    return symbols[:400]
+    log({"event": "UNIVERSE_BUILT", "total": len(symbols), "scanning": min(len(symbols), UNIVERSE_SIZE)})
+    return symbols[:UNIVERSE_SIZE]
 
 
 # =========================================================
@@ -514,39 +520,63 @@ def run():
     universe   = get_universe()
     candidates = []
 
+    # Diagnostic counters
+    stats = {
+        "scanned":           0,
+        "skip_held":         0,
+        "skip_cooldown":     0,
+        "skip_no_bars":      0,
+        "skip_filter":       0,
+        "skip_no_signal":    0,
+        "skip_low_score":    0,
+        "skip_choppy":       0,
+        "passed":            0,
+    }
+
     for symbol in universe:
+        stats["scanned"] += 1
         if symbol in live_positions:
+            stats["skip_held"] += 1
             continue
 
         cooldown = state["cooldowns"].get(symbol)
         if cooldown and now_et() < datetime.fromisoformat(cooldown):
+            stats["skip_cooldown"] += 1
             continue
 
         bars = get_bars(symbol)
         if bars is None:
+            stats["skip_no_bars"] += 1
             continue
 
         df = add_indicators(bars)
         if not passes_filters(df):
+            stats["skip_filter"] += 1
             continue
 
         signals      = detect_signals(df)
         bull_signals = {k: v for k, v in signals.items()
                         if v["direction"] in ("bull", "neutral")}
         if not bull_signals:
+            stats["skip_no_signal"] += 1
             continue
 
-        score, _ = confluence_score(df, "bull")
+        score, score_details = confluence_score(df, "bull")
         if score < confluence_min:
+            stats["skip_low_score"] += 1
+            log({"event": "NEAR_MISS", "symbol": symbol, "score": score, "needed": confluence_min, "signals": list(bull_signals.keys())})
             continue
 
         if market_structure(df) == "choppy":
+            stats["skip_choppy"] += 1
             continue
 
+        stats["passed"] += 1
+        log({"event": "CANDIDATE_FOUND", "symbol": symbol, "score": score, "signals": list(bull_signals.keys()), "details": score_details})
         candidates.append((symbol, df, score))
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    log({"event": "CANDIDATES", "count": len(candidates)})
+    log({"event": "SCAN_COMPLETE", "stats": stats, "candidates": len(candidates)})
 
     for symbol, df, score in candidates[:MAX_TRADES_PER_RUN]:
         r           = df.iloc[-1]
