@@ -23,14 +23,15 @@ Paper trade extensively before production deployment.
 
 import os
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytz
 import numpy as np
 import pandas as pd
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, AssetStatus
+from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest, LimitOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, AssetStatus, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -44,13 +45,33 @@ from candlestick_rules import (
 
 
 # =========================================================
+# RETRY
+# =========================================================
+
+def with_retry(max_attempts=4):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_attempts - 1:
+                        raise
+                    wait = 2 ** attempt
+                    log({"event": "API_RETRY", "func": func.__name__, "attempt": attempt+1, "error": str(e), "wait": wait})
+                    time.sleep(wait)
+        return wrapper
+    return decorator
+
+
+# =========================================================
 # CONFIG
 # =========================================================
 
 MAX_POSITION_RISK_PCT   = 0.005       # 0.5% account risk per trade
 MAX_TOTAL_EXPOSURE_PCT  = 0.25        # 25% deployed capital max
 MAX_TRADES_PER_RUN      = 999         # effectively unlimited - exposure limit is the real cap
-UNIVERSE_SIZE           = 1500        # was 400; scan broader market for setups
+UNIVERSE_SIZE           = 300         # rate limit safety (200 req/min); was 1500
 
 MIN_PRICE               = 5
 MIN_DOLLAR_VOLUME       = 2_000_000
@@ -133,8 +154,10 @@ def load_state():
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
+    tmp_path = STATE_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp_path, STATE_FILE)
 
 
 # =========================================================
@@ -170,6 +193,7 @@ def trading_window():
 # ACCOUNT
 # =========================================================
 
+@with_retry()
 def get_account():
     acct = trading_client.get_account()
     return {
@@ -178,6 +202,7 @@ def get_account():
     }
 
 
+@with_retry()
 def get_live_positions():
     out = {}
     for p in trading_client.get_all_positions():
@@ -205,7 +230,10 @@ def reconcile_positions(state):
     for symbol, pos in live.items():
         if symbol not in state["positions"]:
             entry_price = pos["avg_entry_price"]
-            bars = get_bars(symbol)
+            try:
+                bars = get_bars(symbol)
+            except Exception:
+                bars = None
             if bars is not None:
                 df = add_indicators(bars)
                 atr = float(df["atr"].iloc[-1])
@@ -230,17 +258,14 @@ def reconcile_positions(state):
 # SCANNER
 # =========================================================
 
+@with_retry()
 def get_universe():
     log({"event": "SCAN_START"})
-    try:
-        request = GetAssetsRequest(
-            asset_class=AssetClass.US_EQUITY,
-            status=AssetStatus.ACTIVE,
-        )
-        assets = trading_client.get_all_assets(request)
-    except Exception as e:
-        log({"event": "SCAN_FAIL", "error": str(e)})
-        return []
+    request = GetAssetsRequest(
+        asset_class=AssetClass.US_EQUITY,
+        status=AssetStatus.ACTIVE,
+    )
+    assets = trading_client.get_all_assets(request)
     symbols = [
         a.symbol for a in assets
         if a.tradable
@@ -257,25 +282,23 @@ def get_universe():
 # DATA
 # =========================================================
 
+@with_retry()
 def get_bars(symbol):
-    try:
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=datetime.now(timezone.utc) - timedelta(hours=5),
-            limit=120,
-        )
-        bars = data_client.get_stock_bars(request)
-        df = bars.df
-        if isinstance(df.index, pd.MultiIndex):
-            if symbol not in df.index.get_level_values(0):
-                return None
-            df = df.loc[symbol]
-        if df.empty or len(df) < 60:
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Minute,
+        start=datetime.now(timezone.utc) - timedelta(hours=5),
+        limit=120,
+    )
+    bars = data_client.get_stock_bars(request)
+    df = bars.df
+    if isinstance(df.index, pd.MultiIndex):
+        if symbol not in df.index.get_level_values(0):
             return None
-        return df
-    except Exception:
+        df = df.loc[symbol]
+    if df.empty or len(df) < 60:
         return None
+    return df
 
 
 # =========================================================
@@ -340,14 +363,19 @@ def calculate_position_size(equity, entry_price, stop_price):
 # EXECUTION
 # =========================================================
 
-def submit_buy(symbol, qty):
+def submit_buy(symbol, qty, entry_price, stop_price, target_price):
     try:
-        trading_client.submit_order(MarketOrderRequest(
+        order = LimitOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
-        ))
+            limit_price=round(entry_price * 1.005, 2),
+            order_class=OrderClass.BRACKET,
+            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+            take_profit=TakeProfitRequest(limit_price=round(target_price, 2))
+        )
+        trading_client.submit_order(order)
         log({"event": "BUY_ORDER", "symbol": symbol, "qty": qty})
         return True
     except Exception as e:
@@ -384,7 +412,10 @@ def manage_positions(state):
             continue
 
         qty          = live_positions[symbol]["qty"]
-        bars         = get_bars(symbol)
+        try:
+            bars = get_bars(symbol)
+        except Exception:
+            continue
         if bars is None:
             continue
 
@@ -517,7 +548,12 @@ def run():
         save_state(state)
         return
 
-    universe   = get_universe()
+    try:
+        universe = get_universe()
+    except Exception as e:
+        log({"event": "SCAN_FAIL", "error": str(e)})
+        save_state(state)
+        return
     candidates = []
 
     # Diagnostic counters
@@ -544,7 +580,12 @@ def run():
             stats["skip_cooldown"] += 1
             continue
 
-        bars = get_bars(symbol)
+        try:
+            bars = get_bars(symbol)
+        except Exception:
+            stats["skip_no_bars"] += 1
+            continue
+        time.sleep(0.3)  # rate limit safety - 200 req/min = 0.3s minimum
         if bars is None:
             stats["skip_no_bars"] += 1
             continue
@@ -600,7 +641,7 @@ def run():
         if current_exposure + estimated_cost > equity * MAX_TOTAL_EXPOSURE_PCT:
             continue
 
-        ok = submit_buy(symbol, qty)
+        ok = submit_buy(symbol, qty, entry_price, stop_price, target_price)
         if not ok:
             continue
 

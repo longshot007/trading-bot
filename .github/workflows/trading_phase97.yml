@@ -21,12 +21,17 @@ on:
   # Manual trigger — use this to confirm the workflow is still enabled
   workflow_dispatch:
 
+concurrency:
+  group: trading-bot-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repo
