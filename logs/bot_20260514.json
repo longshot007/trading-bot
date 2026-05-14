@@ -2,3 +2,9 @@
 {"event": "MARKET_CLOSED", "ts": "2026-05-14T02:58:56.014272"}
 {"event": "RUN_START", "ts": "2026-05-14T03:54:32.362332"}
 {"event": "MARKET_CLOSED", "ts": "2026-05-14T03:54:32.515324"}
+{"event": "RUN_START", "ts": "2026-05-14T15:41:40.672117"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-05-14T15:41:40.973632"}
+{"event": "SCAN_START", "ts": "2026-05-14T15:41:41.003544"}
+{"event": "UNIVERSE_BUILT", "total": 7064, "scanning": 300, "ts": "2026-05-14T15:41:41.321352"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 132, "skip_filter": 168, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-05-14T15:43:18.205220"}
+{"event": "RUN_END", "ts": "2026-05-14T15:43:18.205783"}
