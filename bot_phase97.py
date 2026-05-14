@@ -83,7 +83,7 @@ TAKE_PROFIT_MULTIPLIER  = 2.5
 
 MAX_HOLD_DAYS           = 4
 
-DAILY_LOSS_LIMIT        = 20_000
+DAILY_LOSS_LIMIT_PCT    = 0.02        # 2% account equity = daily kill switch
 
 MAX_SPREAD_PCT          = 0.0035
 
@@ -383,7 +383,28 @@ def submit_buy(symbol, qty, entry_price, stop_price, target_price):
         return False
 
 
+@with_retry()
+def cancel_pending_orders(symbol):
+    """Cancel any open child orders for this symbol so we can submit a fresh sell."""
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    try:
+        orders = trading_client.get_orders(
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        )
+        for o in orders:
+            try:
+                trading_client.cancel_order_by_id(o.id)
+                log({"event": "CANCEL_ORDER", "symbol": symbol, "order_id": str(o.id)})
+            except Exception as e:
+                log({"event": "CANCEL_ORDER_FAIL", "symbol": symbol, "order_id": str(o.id), "error": str(e)})
+    except Exception as e:
+        log({"event": "CANCEL_LOOKUP_FAIL", "symbol": symbol, "error": str(e)})
+
+
 def submit_sell(symbol, qty, reason, est_price):
+    cancel_pending_orders(symbol)
+    time.sleep(0.5)
     try:
         trading_client.submit_order(MarketOrderRequest(
             symbol=symbol,
@@ -498,12 +519,18 @@ def close_weak_positions(state):
 def risk_circuit_breaker():
     current_state = load_state()
     closed_pnl_today = current_state.get("closed_pnl_today", 0.0)
-    if closed_pnl_today <= -DAILY_LOSS_LIMIT:
+    try:
+        acct = trading_client.get_account()
+        equity = float(acct.equity)
+    except Exception:
+        equity = 100_000  # fallback if Alpaca unreachable
+    daily_loss_limit_dollars = equity * DAILY_LOSS_LIMIT_PCT
+    if closed_pnl_today <= -daily_loss_limit_dollars:
         if not current_state.get("circuit_breaker_tripped", False):
             current_state["circuit_breaker_tripped"] = True
             current_state["tripped_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             save_state(current_state)
-            log({"event": "CIRCUIT_BREAKER_TRIPPED", "loss": closed_pnl_today, "limit": -DAILY_LOSS_LIMIT})
+            log({"event": "CIRCUIT_BREAKER_TRIPPED", "loss": closed_pnl_today, "limit": -daily_loss_limit_dollars, "equity": equity})
         return True
     return False
 
