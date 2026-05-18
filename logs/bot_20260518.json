@@ -16,3 +16,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-05-18T17:25:50.623824"}
 {"event": "RUN_START", "ts": "2026-05-18T18:24:00.595384"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-05-18T18:24:00.755542"}
+{"event": "RUN_START", "ts": "2026-05-18T19:11:13.655927"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-05-18T19:11:14.251206"}
