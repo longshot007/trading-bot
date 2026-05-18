@@ -10,3 +10,5 @@
 {"event": "UNIVERSE_BUILT", "total": 7073, "scanning": 300, "ts": "2026-05-18T16:42:58.239046"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 151, "skip_filter": 149, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-05-18T16:44:40.617084"}
 {"event": "RUN_END", "ts": "2026-05-18T16:44:40.617476"}
+{"event": "RUN_START", "ts": "2026-05-18T17:16:01.317778"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-05-18T17:16:01.390865"}
