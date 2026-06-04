@@ -18,3 +18,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-06-04T19:07:05.210832"}
 {"event": "RUN_START", "ts": "2026-06-04T19:46:47.291095"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-06-04T19:46:47.529682"}
+{"event": "RUN_START", "ts": "2026-06-04T21:01:05.836422"}
+{"event": "MARKET_CLOSED", "ts": "2026-06-04T21:01:06.148733"}
