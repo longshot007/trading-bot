@@ -22,3 +22,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-06-23T18:15:43.062429"}
 {"event": "RUN_START", "ts": "2026-06-23T19:19:45.454528"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-06-23T19:19:45.554991"}
+{"event": "RUN_START", "ts": "2026-06-23T20:22:17.114517"}
+{"event": "MARKET_CLOSED", "ts": "2026-06-23T20:22:17.335554"}
