@@ -23,3 +23,5 @@
 {"event": "CANDIDATE_FOUND", "symbol": "IBIT", "score": 4, "signals": ["DOJI"], "details": ["uptrend", "near_support", "near_21_sma", "near_fibonacci_50_618"], "ts": "2026-07-02T16:46:23.608347"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 45, "skip_filter": 253, "skip_no_signal": 1, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-07-02T16:46:28.123513"}
 {"event": "RUN_END", "ts": "2026-07-02T16:46:28.124194"}
+{"event": "RUN_START", "ts": "2026-07-02T17:40:08.402743"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-07-02T17:40:08.496199"}
