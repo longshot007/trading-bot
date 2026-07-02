@@ -16,3 +16,10 @@
 {"event": "UNIVERSE_BUILT", "total": 7244, "scanning": 300, "ts": "2026-07-02T16:18:01.999915"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 53, "skip_filter": 247, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-02T16:19:50.657780"}
 {"event": "RUN_END", "ts": "2026-07-02T16:19:50.658280"}
+{"event": "RUN_START", "ts": "2026-07-02T16:44:25.346025"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-07-02T16:44:25.745944"}
+{"event": "SCAN_START", "ts": "2026-07-02T16:44:25.866360"}
+{"event": "UNIVERSE_BUILT", "total": 7244, "scanning": 300, "ts": "2026-07-02T16:44:26.848170"}
+{"event": "CANDIDATE_FOUND", "symbol": "IBIT", "score": 4, "signals": ["DOJI"], "details": ["uptrend", "near_support", "near_21_sma", "near_fibonacci_50_618"], "ts": "2026-07-02T16:46:23.608347"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 45, "skip_filter": 253, "skip_no_signal": 1, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-07-02T16:46:28.123513"}
+{"event": "RUN_END", "ts": "2026-07-02T16:46:28.124194"}
