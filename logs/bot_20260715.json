@@ -29,3 +29,5 @@
 {"event": "NEAR_MISS", "symbol": "BABA", "score": 1, "needed": 4, "signals": ["TWEEZER_BOTTOM", "INSIDE_BAR"], "ts": "2026-07-15T16:45:55.437554"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 44, "skip_filter": 254, "skip_no_signal": 1, "skip_low_score": 1, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-15T16:47:06.501135"}
 {"event": "RUN_END", "ts": "2026-07-15T16:47:06.501504"}
+{"event": "RUN_START", "ts": "2026-07-15T17:39:41.491622"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-07-15T17:39:41.749940"}
