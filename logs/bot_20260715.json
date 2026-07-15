@@ -22,3 +22,10 @@
 {"event": "UNIVERSE_BUILT", "total": 7290, "scanning": 300, "ts": "2026-07-15T16:12:58.327538"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 237, "skip_filter": 63, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-15T16:14:56.387510"}
 {"event": "RUN_END", "ts": "2026-07-15T16:14:56.387985"}
+{"event": "RUN_START", "ts": "2026-07-15T16:44:55.008221"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-07-15T16:44:55.706108"}
+{"event": "SCAN_START", "ts": "2026-07-15T16:44:55.833725"}
+{"event": "UNIVERSE_BUILT", "total": 7290, "scanning": 300, "ts": "2026-07-15T16:44:56.643099"}
+{"event": "NEAR_MISS", "symbol": "BABA", "score": 1, "needed": 4, "signals": ["TWEEZER_BOTTOM", "INSIDE_BAR"], "ts": "2026-07-15T16:45:55.437554"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 44, "skip_filter": 254, "skip_no_signal": 1, "skip_low_score": 1, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-15T16:47:06.501135"}
+{"event": "RUN_END", "ts": "2026-07-15T16:47:06.501504"}
