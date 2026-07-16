@@ -1,0 +1,6 @@
+{"event": "RUN_START", "ts": "2026-07-16T15:17:12.167135"}
+{"event": "TRADING_WINDOW", "window": "FULL", "ts": "2026-07-16T15:17:12.463673"}
+{"event": "SCAN_START", "ts": "2026-07-16T15:17:12.477865"}
+{"event": "UNIVERSE_BUILT", "total": 7296, "scanning": 300, "ts": "2026-07-16T15:17:12.778890"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 266, "skip_filter": 34, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-16T15:18:55.370758"}
+{"event": "RUN_END", "ts": "2026-07-16T15:18:55.371389"}
