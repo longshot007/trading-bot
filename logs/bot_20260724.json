@@ -19,3 +19,9 @@
 {"event": "NEAR_MISS", "symbol": "BITO", "score": 3, "needed": 4, "signals": ["DOJI"], "ts": "2026-07-24T15:54:05.198925"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 218, "skip_filter": 81, "skip_no_signal": 0, "skip_low_score": 1, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-24T15:54:38.271051"}
 {"event": "RUN_END", "ts": "2026-07-24T15:54:38.271671"}
+{"event": "RUN_START", "ts": "2026-07-24T16:58:57.559890"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-07-24T16:58:57.949397"}
+{"event": "SCAN_START", "ts": "2026-07-24T16:58:58.059704"}
+{"event": "UNIVERSE_BUILT", "total": 7332, "scanning": 300, "ts": "2026-07-24T16:58:58.888638"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 58, "skip_filter": 242, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-24T17:01:06.291835"}
+{"event": "RUN_END", "ts": "2026-07-24T17:01:06.292327"}
