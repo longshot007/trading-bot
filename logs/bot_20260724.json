@@ -5,3 +5,10 @@
 {"event": "CANDIDATE_FOUND", "symbol": "BITO", "score": 3, "signals": ["DOJI"], "details": ["near_support", "near_21_sma", "near_fibonacci_50_618"], "ts": "2026-07-24T15:14:26.801719"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 234, "skip_filter": 65, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-07-24T15:15:08.082977"}
 {"event": "RUN_END", "ts": "2026-07-24T15:15:08.083885"}
+{"event": "RUN_START", "ts": "2026-07-24T15:18:55.085495"}
+{"event": "TRADING_WINDOW", "window": "FULL", "ts": "2026-07-24T15:18:55.151967"}
+{"event": "SCAN_START", "ts": "2026-07-24T15:18:55.168017"}
+{"event": "UNIVERSE_BUILT", "total": 7332, "scanning": 300, "ts": "2026-07-24T15:18:55.460211"}
+{"event": "CANDIDATE_FOUND", "symbol": "BITO", "score": 3, "signals": ["BULLISH_ENGULFING", "KICKER_BULL", "TWEEZER_BOTTOM"], "details": ["near_support", "near_21_sma", "near_fibonacci_50_618"], "ts": "2026-07-24T15:20:03.658341"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 230, "skip_filter": 69, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-07-24T15:20:42.489772"}
+{"event": "RUN_END", "ts": "2026-07-24T15:20:42.490669"}
