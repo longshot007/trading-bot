@@ -12,3 +12,10 @@
 {"event": "CANDIDATE_FOUND", "symbol": "BITO", "score": 3, "signals": ["BULLISH_ENGULFING", "KICKER_BULL", "TWEEZER_BOTTOM"], "details": ["near_support", "near_21_sma", "near_fibonacci_50_618"], "ts": "2026-07-24T15:20:03.658341"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 230, "skip_filter": 69, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-07-24T15:20:42.489772"}
 {"event": "RUN_END", "ts": "2026-07-24T15:20:42.490669"}
+{"event": "RUN_START", "ts": "2026-07-24T15:52:58.675164"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-07-24T15:52:58.743270"}
+{"event": "SCAN_START", "ts": "2026-07-24T15:52:58.757692"}
+{"event": "UNIVERSE_BUILT", "total": 7332, "scanning": 300, "ts": "2026-07-24T15:52:59.078762"}
+{"event": "NEAR_MISS", "symbol": "BITO", "score": 3, "needed": 4, "signals": ["DOJI"], "ts": "2026-07-24T15:54:05.198925"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 218, "skip_filter": 81, "skip_no_signal": 0, "skip_low_score": 1, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-07-24T15:54:38.271051"}
+{"event": "RUN_END", "ts": "2026-07-24T15:54:38.271671"}
