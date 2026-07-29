@@ -34,3 +34,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-07-29T18:02:37.723206"}
 {"event": "RUN_START", "ts": "2026-07-29T18:37:55.884582"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-07-29T18:37:55.979378"}
+{"event": "RUN_START", "ts": "2026-07-29T19:37:30.207654"}
+{"event": "TRADING_WINDOW", "window": "WEAK_CLOSE", "ts": "2026-07-29T19:37:30.371503"}
