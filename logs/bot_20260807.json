@@ -6,3 +6,9 @@
 {"event": "MARKET_CLOSED", "ts": "2026-08-07T00:50:43.849786"}
 {"event": "RUN_START", "ts": "2026-08-07T01:00:32.561790"}
 {"event": "MARKET_CLOSED", "ts": "2026-08-07T01:00:32.607136"}
+{"event": "RUN_START", "ts": "2026-08-07T14:31:52.759960"}
+{"event": "TRADING_WINDOW", "window": "FULL", "ts": "2026-08-07T14:31:53.329972"}
+{"event": "SCAN_START", "ts": "2026-08-07T14:31:53.443972"}
+{"event": "UNIVERSE_BUILT", "total": 7390, "scanning": 300, "ts": "2026-08-07T14:31:54.189802"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 274, "skip_filter": 26, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-08-07T14:34:08.813532"}
+{"event": "RUN_END", "ts": "2026-08-07T14:34:08.814025"}
