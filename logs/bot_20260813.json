@@ -4,3 +4,9 @@
 {"event": "UNIVERSE_BUILT", "total": 7402, "scanning": 300, "ts": "2026-08-13T14:48:45.013313"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 170, "skip_filter": 130, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-08-13T14:50:42.986001"}
 {"event": "RUN_END", "ts": "2026-08-13T14:50:42.986554"}
+{"event": "RUN_START", "ts": "2026-08-13T15:29:53.576693"}
+{"event": "TRADING_WINDOW", "window": "FULL", "ts": "2026-08-13T15:29:54.049878"}
+{"event": "SCAN_START", "ts": "2026-08-13T15:29:54.198329"}
+{"event": "UNIVERSE_BUILT", "total": 7402, "scanning": 300, "ts": "2026-08-13T15:29:55.203198"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 96, "skip_filter": 204, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-08-13T15:32:41.932386"}
+{"event": "RUN_END", "ts": "2026-08-13T15:32:41.932878"}
