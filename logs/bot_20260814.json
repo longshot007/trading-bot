@@ -41,3 +41,5 @@
 {"event": "CANDIDATE_FOUND", "symbol": "NVDA", "score": 5, "signals": ["TWEEZER_BOTTOM"], "details": ["uptrend", "near_support", "near_21_sma", "near_fibonacci_50_618", "volume_confirmed"], "ts": "2026-08-14T16:35:48.740170"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 78, "skip_filter": 221, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-08-14T16:36:04.412048"}
 {"event": "RUN_END", "ts": "2026-08-14T16:36:04.412931"}
+{"event": "RUN_START", "ts": "2026-08-14T17:23:54.524891"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-08-14T17:23:55.238644"}
