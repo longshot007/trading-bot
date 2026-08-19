@@ -65,3 +65,5 @@
 {"event": "CANDIDATE_FOUND", "symbol": "QQQ", "score": 5, "signals": ["TWEEZER_BOTTOM", "INSIDE_BAR"], "details": ["stoch_oversold", "stoch_turning_up", "near_support", "near_fibonacci_50_618", "volume_confirmed"], "ts": "2026-08-19T16:52:47.074365"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 117, "skip_filter": 182, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-08-19T16:53:24.090568"}
 {"event": "RUN_END", "ts": "2026-08-19T16:53:24.091169"}
+{"event": "RUN_START", "ts": "2026-08-19T17:04:04.445715"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-08-19T17:04:04.593688"}
