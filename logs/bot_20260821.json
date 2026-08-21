@@ -74,3 +74,5 @@
 {"event": "TRADING_WINDOW", "window": "WEAK_CLOSE", "ts": "2026-08-21T19:32:17.324478"}
 {"event": "RUN_START", "ts": "2026-08-21T19:43:29.631872"}
 {"event": "TRADING_WINDOW", "window": "WEAK_CLOSE", "ts": "2026-08-21T19:43:29.899854"}
+{"event": "RUN_START", "ts": "2026-08-21T19:51:35.211046"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-08-21T19:51:35.301038"}
