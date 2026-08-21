@@ -80,3 +80,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-08-21T19:57:22.140763"}
 {"event": "RUN_START", "ts": "2026-08-21T20:14:28.493056"}
 {"event": "MARKET_CLOSED", "ts": "2026-08-21T20:14:29.080104"}
+{"event": "RUN_START", "ts": "2026-08-21T20:17:31.393646"}
+{"event": "MARKET_CLOSED", "ts": "2026-08-21T20:17:31.627853"}
