@@ -40,3 +40,10 @@
 {"event": "UNIVERSE_BUILT", "total": 7435, "scanning": 300, "ts": "2026-08-25T16:10:43.851043"}
 {"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 188, "skip_filter": 112, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 0}, "candidates": 0, "ts": "2026-08-25T16:12:25.462448"}
 {"event": "RUN_END", "ts": "2026-08-25T16:12:25.463144"}
+{"event": "RUN_START", "ts": "2026-08-25T16:48:39.996981"}
+{"event": "TRADING_WINDOW", "window": "CONFLUENCE", "ts": "2026-08-25T16:48:40.420972"}
+{"event": "SCAN_START", "ts": "2026-08-25T16:48:40.556555"}
+{"event": "UNIVERSE_BUILT", "total": 7435, "scanning": 300, "ts": "2026-08-25T16:48:41.335140"}
+{"event": "CANDIDATE_FOUND", "symbol": "SQQQ", "score": 4, "signals": ["TWEEZER_BOTTOM"], "details": ["stoch_oversold", "stoch_turning_up", "near_support", "near_fibonacci_50_618"], "ts": "2026-08-25T16:49:20.365519"}
+{"event": "SCAN_COMPLETE", "stats": {"scanned": 300, "skip_held": 0, "skip_cooldown": 0, "skip_no_bars": 234, "skip_filter": 65, "skip_no_signal": 0, "skip_low_score": 0, "skip_choppy": 0, "passed": 1}, "candidates": 1, "ts": "2026-08-25T16:50:35.670498"}
+{"event": "RUN_END", "ts": "2026-08-25T16:50:35.671336"}
