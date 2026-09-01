@@ -2,3 +2,5 @@
 {"event": "MARKET_CLOSED", "ts": "2026-09-01T00:00:12.447444"}
 {"event": "RUN_START", "ts": "2026-09-01T00:24:34.256764"}
 {"event": "MARKET_CLOSED", "ts": "2026-09-01T00:24:34.353344"}
+{"event": "RUN_START", "ts": "2026-09-01T17:22:56.800965"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-01T17:22:56.889956"}
