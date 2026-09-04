@@ -6,3 +6,5 @@
 {"event": "RUN_END", "ts": "2026-09-04T16:59:04.242550"}
 {"event": "RUN_START", "ts": "2026-09-04T17:12:02.917957"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-04T17:12:03.381565"}
+{"event": "RUN_START", "ts": "2026-09-04T17:42:12.551587"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-04T17:42:13.317723"}
