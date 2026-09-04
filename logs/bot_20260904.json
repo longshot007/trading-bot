@@ -8,3 +8,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-04T17:12:03.381565"}
 {"event": "RUN_START", "ts": "2026-09-04T17:42:12.551587"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-04T17:42:13.317723"}
+{"event": "RUN_START", "ts": "2026-09-04T17:53:53.685915"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-04T17:53:54.099662"}
