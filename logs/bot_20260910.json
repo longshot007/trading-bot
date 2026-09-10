@@ -2,3 +2,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-10T17:04:55.137181"}
 {"event": "RUN_START", "ts": "2026-09-10T17:21:16.713184"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-10T17:21:16.785277"}
+{"event": "RUN_START", "ts": "2026-09-10T17:46:15.909542"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-09-10T17:46:16.306289"}
