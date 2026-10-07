@@ -4,3 +4,5 @@
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-10-07T19:27:12.725985"}
 {"event": "RUN_START", "ts": "2026-10-07T19:36:42.264314"}
 {"event": "TRADING_WINDOW", "window": "WEAK_CLOSE", "ts": "2026-10-07T19:36:42.343479"}
+{"event": "RUN_START", "ts": "2026-10-07T20:03:14.049088"}
+{"event": "MARKET_CLOSED", "ts": "2026-10-07T20:03:14.164827"}
