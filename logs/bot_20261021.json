@@ -1,2 +1,4 @@
 {"event": "RUN_START", "ts": "2026-10-21T18:10:07.807077"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-10-21T18:10:08.587373"}
+{"event": "RUN_START", "ts": "2026-10-21T18:17:10.013089"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-10-21T18:17:10.413708"}
