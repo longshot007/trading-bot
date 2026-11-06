@@ -4,3 +4,5 @@
 {"event": "MARKET_CLOSED", "ts": "2026-11-06T01:23:36.489288"}
 {"event": "RUN_START", "ts": "2026-11-06T20:01:26.256395"}
 {"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-11-06T20:01:26.381602"}
+{"event": "RUN_START", "ts": "2026-11-06T20:07:17.854340"}
+{"event": "TRADING_WINDOW", "window": "EXITS_ONLY", "ts": "2026-11-06T20:07:18.091581"}
